@@ -1,0 +1,141 @@
+name: Sync upstream CLIProxyAPI
+
+# 定时轮询上游 router-for-me/CLIProxyAPI 的最新 release，把我们的补丁 rebase 上去，
+# go.mod 冲突自动用「取上游版 + go mod tidy」收口，编译 + 测试通过就开 PR 供审核；
+# 遇到非 go.mod 冲突或编译/测试失败则开 issue 让人处理。
+#
+# 一次性前提（仓库 Settings → Actions → General → Workflow permissions）：
+#   勾选 “Allow GitHub Actions to create and approve pull requests”，否则开 PR 会 403。
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # 每天 06:17 UTC 轮询
+  workflow_dispatch: {} # 也可在 Actions 页手动触发
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  UPSTREAM: router-for-me/CLIProxyAPI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout（全量历史 + tags）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Go（版本跟随 go.mod）
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve versions
+        id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          latest=$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name)
+          base=$(cat .upstream-base 2>/dev/null | tr -d '[:space:]' || true)
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "base=$base"     >> "$GITHUB_OUTPUT"
+          if [ "$latest" = "$base" ]; then
+            echo "up_to_date=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "base=$base latest=$latest"
+
+      - name: Up to date
+        if: steps.v.outputs.up_to_date == 'true'
+        run: echo "已是最新（base=${{ steps.v.outputs.base }}），无需同步。"
+
+      - name: Rebase patches onto new tag
+        if: steps.v.outputs.up_to_date == 'false'
+        id: rebase
+        env:
+          NEW: ${{ steps.v.outputs.latest }}
+          BASE: ${{ steps.v.outputs.base }}
+        run: |
+          set -uo pipefail
+          git config user.name  "wukong-sync-bot"
+          git config user.email "wukong-sync-bot@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --tags --no-recurse-submodules upstream
+
+          branch="sync/${NEW}"
+          git checkout -B "$branch" main
+
+          # 把 BASE..main（我们的补丁）rebase 到上游新 tag
+          if ! git rebase --onto "$NEW" "$BASE" "$branch"; then
+            # 自动解冲突：仅当未合并文件全是 go.mod/go.sum 时，取上游版 + go mod tidy
+            while [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; do
+              unmerged=$(git diff --name-only --diff-filter=U | sort -u)
+              non_gomod=$(printf '%s\n' "$unmerged" | grep -vE '^(go\.mod|go\.sum)$' || true)
+              if [ -n "$unmerged" ] && [ -z "$non_gomod" ]; then
+                git checkout "$NEW" -- go.mod go.sum
+                go mod tidy
+                git add go.mod go.sum
+                GIT_EDITOR=true git rebase --continue || true
+              else
+                {
+                  echo "status=conflict"
+                  echo "conflict<<EOF"
+                  printf '%s\n' "$unmerged"
+                  echo "EOF"
+                } >> "$GITHUB_OUTPUT"
+                git rebase --abort || true
+                exit 0
+              fi
+            done
+          fi
+
+          # 更新基线标记（下次同步据此比较）
+          printf '%s\n' "$NEW" > .upstream-base
+          git add .upstream-base
+          git commit -m "chore: sync upstream base to ${NEW}"
+          echo "status=rebased" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch"  >> "$GITHUB_OUTPUT"
+
+      - name: Build & test
+        if: steps.rebase.outputs.status == 'rebased'
+        id: verify
+        run: |
+          set -uo pipefail
+          if go build ./... && go test ./wukong/...; then
+            echo "status=green" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=red" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push branch & open PR（绿）
+        if: steps.verify.outputs.status == 'green'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW: ${{ steps.v.outputs.latest }}
+          BRANCH: ${{ steps.rebase.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git push -f origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "Sync to upstream ${NEW}" \
+            --body "自动把补丁 rebase 到上游 \`${NEW}\`；go.mod 已用「取上游版 + go mod tidy」收口；\`go build ./...\` 与 \`go test ./wukong/...\` 均通过。建议 squash 合并以保持历史干净。" \
+            || echo "PR 可能已存在（分支已强推更新）。"
+
+      - name: Open issue（冲突或红）
+        if: steps.rebase.outputs.status == 'conflict' || steps.verify.outputs.status == 'red'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW: ${{ steps.v.outputs.latest }}
+          CONFLICT: ${{ steps.rebase.outputs.conflict }}
+        run: |
+          set -euo pipefail
+          gh issue create \
+            --title "需人工同步到上游 ${NEW}" \
+            --body $'自动同步失败，需人工处理。\n\n可能原因：\n- `sdk/cliproxy/service_executors.go` / `service_models.go` 的钩子行与上游改动冲突（非 go.mod，无法自动解）；\n- 上游 API 变更导致 `go build` / `go test ./wukong/...` 失败。\n\n冲突文件（若有）：\n```\n'"${CONFLICT:-见 Actions 日志}"$'\n```\n详情见本次 Actions 运行日志。'
