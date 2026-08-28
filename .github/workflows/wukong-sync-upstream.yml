@@ -118,12 +118,15 @@ jobs:
         if: steps.verify.outputs.status == 'green'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
           NEW: ${{ steps.v.outputs.latest }}
           BRANCH: ${{ steps.rebase.outputs.branch }}
         run: |
           set -euo pipefail
           git push -f origin "$BRANCH"
-          gh pr create --base main --head "$BRANCH" \
+          # 必须显式 -R 指定本仓库：CI 里同时有 origin 与 upstream 两个 remote，
+          # 不指定会被解析到 upstream(router-for-me)，对其无权创建 PR。
+          gh pr create -R "$REPO" --base main --head "$BRANCH" \
             --title "Sync to upstream ${NEW}" \
             --body "自动把补丁 rebase 到上游 \`${NEW}\`；go.mod 已用「取上游版 + go mod tidy」收口；\`go build ./...\` 与 \`go test ./wukong/...\` 均通过。建议 squash 合并以保持历史干净。" \
             || echo "PR 可能已存在（分支已强推更新）。"
@@ -132,10 +135,11 @@ jobs:
         if: steps.rebase.outputs.status == 'conflict' || steps.verify.outputs.status == 'red'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
           NEW: ${{ steps.v.outputs.latest }}
           CONFLICT: ${{ steps.rebase.outputs.conflict }}
         run: |
           set -euo pipefail
-          gh issue create \
+          gh issue create -R "$REPO" \
             --title "需人工同步到上游 ${NEW}" \
             --body $'自动同步失败，需人工处理。\n\n可能原因：\n- `sdk/cliproxy/service_executors.go` / `service_models.go` 的钩子行与上游改动冲突（非 go.mod，无法自动解）；\n- 上游 API 变更导致 `go build` / `go test ./wukong/...` 失败。\n\n冲突文件（若有）：\n```\n'"${CONFLICT:-见 Actions 日志}"$'\n```\n详情见本次 Actions 运行日志。'
