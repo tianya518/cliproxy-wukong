@@ -1,8 +1,13 @@
 name: Sync upstream CLIProxyAPI
 
-# 定时轮询上游 router-for-me/CLIProxyAPI 的最新 release，把我们的补丁 rebase 上去，
+# 定时轮询上游 router-for-me/CLIProxyAPI 的最新 release，把上游新 tag merge 进本仓库，
 # go.mod 冲突自动用「取上游版 + go mod tidy」收口，编译 + 测试通过就开 PR 供审核；
 # 遇到非 go.mod 冲突或编译/测试失败则开 issue 让人处理。
+#
+# 为什么用 merge 而非 rebase：本仓库 = 上游 + 我们的补丁。用 merge 把上游 tag 并进来，
+# 上游 tag 会成为 main 的祖先，下一次同步的 merge-base 自然是上一版，链路可持续；PR 也能
+# 直接点“合并”按钮落地。**务必用 “Create a merge commit” 合并 PR，不要 squash**——squash 会
+# 丢掉上游 tag 的祖先关系，导致下次 merge 把上游改动重放而冲突。仓库已设为仅允许 merge commit。
 #
 # 一次性前提（仓库 Settings → Actions → General → Workflow permissions）：
 #   勾选 “Allow GitHub Actions to create and approve pull requests”，否则开 PR 会 403。
@@ -56,12 +61,11 @@ jobs:
         if: steps.v.outputs.up_to_date == 'true'
         run: echo "已是最新（base=${{ steps.v.outputs.base }}），无需同步。"
 
-      - name: Rebase patches onto new tag
+      - name: Merge upstream tag
         if: steps.v.outputs.up_to_date == 'false'
-        id: rebase
+        id: merge
         env:
           NEW: ${{ steps.v.outputs.latest }}
-          BASE: ${{ steps.v.outputs.base }}
         run: |
           set -uo pipefail
           git config user.name  "wukong-sync-bot"
@@ -72,39 +76,37 @@ jobs:
           branch="sync/${NEW}"
           git checkout -B "$branch" main
 
-          # 把 BASE..main（我们的补丁）rebase 到上游新 tag
-          if ! git rebase --onto "$NEW" "$BASE" "$branch"; then
+          # 把上游新 tag merge 进来
+          if ! git merge --no-edit "$NEW"; then
             # 自动解冲突：仅当未合并文件全是 go.mod/go.sum 时，取上游版 + go mod tidy
-            while [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; do
-              unmerged=$(git diff --name-only --diff-filter=U | sort -u)
-              non_gomod=$(printf '%s\n' "$unmerged" | grep -vE '^(go\.mod|go\.sum)$' || true)
-              if [ -n "$unmerged" ] && [ -z "$non_gomod" ]; then
-                git checkout "$NEW" -- go.mod go.sum
-                go mod tidy
-                git add go.mod go.sum
-                GIT_EDITOR=true git rebase --continue || true
-              else
-                {
-                  echo "status=conflict"
-                  echo "conflict<<EOF"
-                  printf '%s\n' "$unmerged"
-                  echo "EOF"
-                } >> "$GITHUB_OUTPUT"
-                git rebase --abort || true
-                exit 0
-              fi
-            done
+            unmerged=$(git diff --name-only --diff-filter=U | sort -u)
+            non_gomod=$(printf '%s\n' "$unmerged" | grep -vE '^(go\.mod|go\.sum)$' || true)
+            if [ -n "$unmerged" ] && [ -z "$non_gomod" ]; then
+              git checkout "$NEW" -- go.mod go.sum
+              go mod tidy
+              git add go.mod go.sum
+              git commit --no-edit
+            else
+              {
+                echo "status=conflict"
+                echo "conflict<<EOF"
+                printf '%s\n' "$unmerged"
+                echo "EOF"
+              } >> "$GITHUB_OUTPUT"
+              git merge --abort || true
+              exit 0
+            fi
           fi
 
           # 更新基线标记（下次同步据此比较）
           printf '%s\n' "$NEW" > .upstream-base
           git add .upstream-base
           git commit -m "chore: sync upstream base to ${NEW}"
-          echo "status=rebased" >> "$GITHUB_OUTPUT"
+          echo "status=merged" >> "$GITHUB_OUTPUT"
           echo "branch=$branch"  >> "$GITHUB_OUTPUT"
 
       - name: Build & test
-        if: steps.rebase.outputs.status == 'rebased'
+        if: steps.merge.outputs.status == 'merged'
         id: verify
         run: |
           set -uo pipefail
@@ -120,7 +122,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           NEW: ${{ steps.v.outputs.latest }}
-          BRANCH: ${{ steps.rebase.outputs.branch }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
         run: |
           set -euo pipefail
           git push -f origin "$BRANCH"
@@ -128,16 +130,16 @@ jobs:
           # 不指定会被解析到 upstream(router-for-me)，对其无权创建 PR。
           gh pr create -R "$REPO" --base main --head "$BRANCH" \
             --title "Sync to upstream ${NEW}" \
-            --body "自动把补丁 rebase 到上游 \`${NEW}\`；go.mod 已用「取上游版 + go mod tidy」收口；\`go build ./...\` 与 \`go test ./wukong/...\` 均通过。建议 squash 合并以保持历史干净。" \
+            --body "自动把上游 \`${NEW}\` merge 进来；go.mod 已用「取上游版 + go mod tidy」收口；\`go build ./...\` 与 \`go test ./wukong/...\` 均通过。**请用 “Create a merge commit” 合并，勿 squash**（仓库已限制为仅 merge commit）。" \
             || echo "PR 可能已存在（分支已强推更新）。"
 
       - name: Open issue（冲突或红）
-        if: steps.rebase.outputs.status == 'conflict' || steps.verify.outputs.status == 'red'
+        if: steps.merge.outputs.status == 'conflict' || steps.verify.outputs.status == 'red'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           NEW: ${{ steps.v.outputs.latest }}
-          CONFLICT: ${{ steps.rebase.outputs.conflict }}
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
         run: |
           set -euo pipefail
           gh issue create -R "$REPO" \
