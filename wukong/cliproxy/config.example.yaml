@@ -1,0 +1,20 @@
+# wukong-gateway 的 CLIProxyAPI 配置示例。
+#
+# 注意这里**没有** openai-compatibility 段：ChatGPT / Grok 网页逆向都以
+# 进程内 provider 注册（chatgpt-web、grok-web），不再需要外部 HTTP 上游。
+# ChatGPT 凭证来自 chatgpt.json（旧名 tokens.json 仍可用），Grok SSO 来自 grok.json。
+
+host: "127.0.0.1"
+port: 8317
+
+auth-dir: "./auths"
+
+# 入站客户端凭据：Open WebUI / Claude Code / Gemini CLI 用它访问本网关
+api-keys:
+  - "sk-local-test"
+
+debug: false
+
+remote-management:
+  allow-remote: false
+  secret-key: ""
