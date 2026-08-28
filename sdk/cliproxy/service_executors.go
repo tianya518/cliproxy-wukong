@@ -242,6 +242,11 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 	if s == nil || s.coreManager == nil || a == nil {
 		return
 	}
+	// wukong 薄 fork：进程内原生 provider 优先接管，绝不被 openai-compat 回退覆盖。
+	// 详见 native_provider.go。
+	if s.registerNativeExecutorForAuth(a) {
+		return
+	}
 	s.cfgMu.RLock()
 	cfg := s.cfg
 	s.cfgMu.RUnlock()
