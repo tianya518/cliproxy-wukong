@@ -37,16 +37,30 @@ func loadLiveFrames(t *testing.T) [][][]int {
 	return frames
 }
 
+// live 向量抓取自 2026-08-29 grok.com/imagine 的真实浏览器签名（钩住 crypto.subtle.digest
+// 拿到喂给 SHA-256 的 hashInput，并与真实 x-statsig-id 的 hash 前 16 字节逐一对齐）。
+// 这些值锁定当前 Grok 反爬算法：格式 METHOD!path!counter+"obfiowerehiring"+animationKey，
+// meta 字节下标 5/39/28,36,41，Botox 曲线见 botox_curves_live.json。
 func TestStatsigAnimationKeyMatchesLiveImagineSamples(t *testing.T) {
 	frames := loadLiveFrames(t)
 	samples := []struct {
 		meta string
 		key  string
 	}{
-		{"N2TClog28dgNkB/DTx4dTDMVMyD7ciQ0TvBshBKifYegVKBZpoLYwhF1lGRrZlzF", "a8cac410028f5c28f5c28f60028f5c28f5c28f6100"},
-		{"HGDro4IESrKObEIv/f8BU3+o37iiOs/N1ppFMablmbJrXraa9TLPrblJB+AyVVXr", "555cf4100f5c28f5c28f5c00f5c28f5c28f5c100"},
+		{"A1Hh9DGzAQ9m9EdXg8PAnvua6mDS9ZSCypbM82jY4v8j/WjW853LN5P/a03gUp50", "cd3d590f851eb851eb8504040f851eb851eb8500"},
+		{"AWbgObdGEyo7WF4m/4yCqnaI4VLTqP4YLMykCx+UknImug7mi1RFXNRHqSDNx8oH", "2ad8e30eb851eb851eb8806147ae147ae14806147ae147ae1480eb851eb851eb8800"},
+		{"iCWLhcmYw6nDpBUg9Xn6Eqk5f6cNJh2Gu5frGcy/EgoatowZWcNSqSUIH2JO+6WJ", "e7eebf101999999999999a01999999999999a100"},
+		{"hd6xqr/3xCIgrwpODdiuN19HFCxsmbrC63CncZlu1U3iyUHhw4bMkefgZQ9DeJYa", "46413b100100"},
+		{"tFojyacuwZzEO1fxWg3Yf8RZx+z5Fov5OS9US7E4OQBSvsu5Ux3YHJh8GQ1qBaWX", "33ebef100ccccccccccccd00ccccccccccccd100"},
+		{"97LDdtUd5jyrDO7QunY8R1B0nSikzqyqa5LEL0GEcSu4EiRp0aqyPGFy17OVpyGc", "291c3a100100"},
+		{"BrQQ7/ddw3Ta2spnSkjBc2raPojXC5Qcy9vv9tfoUxRthu51e7Na4EBKHVrsHLcU", "16c3eb0eb851eb851eb8806147ae147ae14806147ae147ae1480eb851eb851eb8800"},
+		{"8GBKvuwwKsHgaf0qLqD6bw6lRF67Q+JP8Ep5+e9bW72mfu9DxPDSW3uzqWDWF14K", "c2ff8506b851eb851eb840e8f5c28f5c28f80e8f5c28f5c28f806b851eb851eb8400"},
+		{"1IA+Xig9MX1sJmNtk4JNVczTOZCbPV2KGEWwFx0sTD9BQp0dTa6Lh2r6YrlrRsnc", "a8b2c0deb851eb851eb807d70a3d70a3d707d70a3d70a3d70deb851eb851eb800"},
+		{"Lwve81yx0k72wG1/DqHX6jBuSncTqOEzYyrG6eZGpX2wv9RUaGmjbSld9Vm2LYhr", "e6e35b0b5c28f5c28f5c0b3333333333330b3333333333330b5c28f5c28f5c00"},
+		{"TTk6RH+3eKVfY97AghCPcNZvys9ueD0ensrSsnb9mzJ0cZ86n7VrnDT8gef53MzN", "7938c40c7ae147ae147b09eb851eb851eb809eb851eb851eb80c7ae147ae147b00"},
+		{"CGGapErn1K8NvnnusYg+k6b0TgBd1H93+frnarNyun++EXuxbhh3IYLCf169Cbj3", "4938370fd70a3d70a3d702b851eb851eb8602b851eb851eb860fd70a3d70a3d700"},
 	}
-	now := time.Date(2026, 8, 26, 3, 20, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 29, 6, 40, 0, 0, time.UTC)
 	for _, sample := range samples {
 		materials, err := buildStatsigMaterials(sample.meta, frames, now)
 		if err != nil {
@@ -64,6 +78,33 @@ func TestStatsigAnimationKeyMatchesLiveImagineSamples(t *testing.T) {
 		}
 		if !strings.Contains(signed.HashInput, sample.key) || !strings.HasPrefix(signed.HashInput, "POST!/rest/app-chat/conversations/new!") {
 			t.Fatalf("%s hash input = %s", sample.meta[:8], signed.HashInput)
+		}
+		if signed.Indices != "5/39/28,36,41" || signed.IndexSource != "default" {
+			t.Fatalf("indices=%s source=%s", signed.Indices, signed.IndexSource)
+		}
+	}
+
+	const liveMeta = "CGGapErn1K8NvnnusYg+k6b0TgBd1H93+frnarNyun++EXuxbhh3IYLCf169Cbj3"
+	liveNow := time.Unix(statsigEpoch+105061461, 0).UTC()
+	liveMaterials, err := buildStatsigMaterials(liveMeta, frames, liveNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vectors := []struct {
+		method, path, hash16 string
+	}{
+		{"GET", "/rest/products", "556bb005fcf8ad920debb93757c97159"},
+		{"POST", "/rest/models/imagine/overrides", "e288267500d295982d21c6579518dbc1"},
+		{"POST", "/rest/media/imagine/quota_info", "d89dd16e416eb3baa12beb58a871ef94"},
+		{"POST", "/rest/modes", "57560bc8853d9693e8f213513fd9a5ee"},
+	}
+	for _, v := range vectors {
+		signed, err := signStatsigIDWithTrace(v.method, v.path, liveMaterials, liveNow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if signed.Hash16 != v.hash16 {
+			t.Fatalf("%s %s hash16 = %s want %s", v.method, v.path, signed.Hash16, v.hash16)
 		}
 	}
 }
@@ -135,7 +176,7 @@ func TestExtractStatsigCurvesFromNextFlightScript(t *testing.T) {
 	if err := validateStatsigFrames(frames); err != nil {
 		t.Fatal(err)
 	}
-	keyBytes, err := decodeStatsigMetaBytes("N2TClog28dgNkB/DTx4dTDMVMyD7ciQ0TvBshBKifYegVKBZpoLYwhF1lGRrZlzF")
+	keyBytes, err := decodeStatsigMetaBytes("A1Hh9DGzAQ9m9EdXg8PAnvua6mDS9ZSCypbM82jY4v8j/WjW853LN5P/a03gUp50")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +184,7 @@ func TestExtractStatsigCurvesFromNextFlightScript(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if key != "a8cac410028f5c28f5c28f60028f5c28f5c28f6100" {
+	if key != "cd3d590f851eb851eb8504040f851eb851eb8500" {
 		t.Fatalf("flight-extracted key = %s", key)
 	}
 }
@@ -170,7 +211,7 @@ func TestExtractStatsigCurvesFromLoadingXAnimSVG(t *testing.T) {
 	if err := validateStatsigFrames(frames); err != nil {
 		t.Fatal(err)
 	}
-	keyBytes, err := decodeStatsigMetaBytes("N2TClog28dgNkB/DTx4dTDMVMyD7ciQ0TvBshBKifYegVKBZpoLYwhF1lGRrZlzF")
+	keyBytes, err := decodeStatsigMetaBytes("qDERYWWMrY6+THhn9LY4akMGRnA3WD9M4tmxAd3lcFLn/wHI7GVSU/t8pcYurMIb")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +219,7 @@ func TestExtractStatsigCurvesFromLoadingXAnimSVG(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if key != "a8cac410028f5c28f5c28f60028f5c28f5c28f6100" {
+	if key != "99bba10947ae147ae14780cf5c28f5c28f60cf5c28f5c28f60947ae147ae147800" {
 		t.Fatalf("svg-extracted key = %s", key)
 	}
 }

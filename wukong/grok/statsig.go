@@ -285,12 +285,16 @@ func (c *Client) requestStatsigSignature(ctx context.Context, method, path, meta
 }
 
 func statsigRequestPath(target string) string {
-	path := target
-	if parsed, err := url.Parse(target); err == nil && parsed.Path != "" {
-		path = parsed.EscapedPath()
-		if parsed.RawQuery != "" {
-			path += "?" + parsed.RawQuery
+	parsed, err := url.Parse(target)
+	if err != nil {
+		if strings.TrimSpace(target) == "" {
+			return "/"
 		}
+		return target
+	}
+	path := parsed.EscapedPath()
+	if path == "" {
+		return "/"
 	}
 	return path
 }

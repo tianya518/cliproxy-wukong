@@ -51,6 +51,8 @@ type statsigSignedID struct {
 	HashInput    string
 	Hash16       string
 	Counter      int64
+	Indices      string
+	IndexSource  string
 }
 
 func signStatsigID(method, path string, materials statsigPageMaterials, now time.Time) (string, error) {
@@ -93,6 +95,8 @@ func signStatsigIDWithTrace(method, path string, materials statsigPageMaterials,
 		HashInput:    hashInput,
 		Hash16:       fmt.Sprintf("%x", sum[:16]),
 		Counter:      counter,
+		Indices:      materials.indices.String(),
+		IndexSource:  materials.indices.Source,
 	}, nil
 }
 

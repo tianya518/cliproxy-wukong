@@ -10,13 +10,17 @@ import (
 )
 
 // grok.com botoxSign 里写死的 meta 下标（不是从 48 字节 meta 算出来的）。
-// 前端发版会改这些字面量；运行时从 signer JS 抽，抽不到才用最近一次对照成功的值。
+// 前端发版会改这些字面量；运行时从懒加载签名器 JS 抽，抽不到才用这里最近一次对照成功的值。
+// 当前值于 2026-08-29 对照 grok.com/imagine 真实签名（详见 statsig_compare_test.go 的 live 向量）。
+// 签名器本体重度混淆，但下标仍是明文；discoverStatsigIndices 会跟完
+// botoxSign → 模块 ID → chunk 映射 → 懒加载签名器。上一版 5/12/18,11,46
+// 以及中间的 5/22/9,11,20 已失效，表现为 conversations/new 返回 403 code 7。
 const (
 	statsigSVGIndexByte = 5
-	statsigRowIndexByte = 12
-	statsigTimeIndexA   = 18
-	statsigTimeIndexB   = 11
-	statsigTimeIndexC   = 46
+	statsigRowIndexByte = 39
+	statsigTimeIndexA   = 28
+	statsigTimeIndexB   = 36
+	statsigTimeIndexC   = 41
 )
 
 type statsigByteIndices struct {
@@ -236,7 +240,7 @@ func resolveStatsigChunkRef(raw, pageURL string) (string, bool) {
 func (c *Client) resolveStatsigIndices(ctx context.Context, pageHTML []byte, pagePath string) statsigByteIndices {
 	if c.statsig != nil {
 		c.statsig.mu.Lock()
-		cached := !c.statsig.indicesUntil.IsZero() && time.Now().Before(c.statsig.indicesUntil)
+		cached := !c.statsig.indicesUntil.IsZero() && time.Now().Before(c.statsig.indicesUntil) && c.statsig.indices.Source != ""
 		if cached {
 			idx := c.statsig.indices
 			c.statsig.mu.Unlock()
@@ -258,29 +262,53 @@ func (c *Client) resolveStatsigIndices(ctx context.Context, pageHTML []byte, pag
 }
 
 func (c *Client) discoverStatsigIndices(ctx context.Context, pageHTML []byte, pagePath string) (statsigByteIndices, bool) {
+	idx, _, ok := c.discoverStatsigIndicesCounted(ctx, pageHTML, pagePath)
+	return idx, ok
+}
+
+func (c *Client) discoverStatsigIndicesCounted(ctx context.Context, pageHTML []byte, pagePath string) (statsigByteIndices, int, bool) {
+	if c == nil {
+		idx, fetches, ok := discoverStatsigIndicesWithFetch(ctx, pageHTML, statsigPageURL("", pagePath), nil)
+		return idx, fetches, ok
+	}
+	pageURL := statsigPageURL(c.baseURL(), pagePath)
+	return discoverStatsigIndicesWithFetch(ctx, pageHTML, pageURL, c.fetchStatsigScript)
+}
+
+func statsigPageURL(baseURL, pagePath string) string {
+	base := strings.TrimRight(baseURL, "/")
+	if pagePath == "" {
+		return base + "/imagine"
+	}
+	return base + pagePath
+}
+
+func discoverStatsigIndicesWithFetch(ctx context.Context, pageHTML []byte, pageURL string, fetch func(context.Context, string) ([]byte, error)) (statsigByteIndices, int, bool) {
 	if idx, ok := extractStatsigByteIndices(pageHTML); ok {
 		idx.Source = "html"
-		return idx, true
+		return idx, 0, true
 	}
-	if c == nil {
-		return statsigByteIndices{}, false
+	if fetch == nil {
+		return statsigByteIndices{}, 0, false
 	}
-	pageURL := strings.TrimRight(c.baseURL(), "/") + pagePath
-	if pagePath == "" {
-		pageURL = strings.TrimRight(c.baseURL(), "/") + "/imagine"
+	if pageURL == "" {
+		pageURL = "https://grok.com/imagine"
 	}
-	queue := extractStatsigScriptURLs(pageHTML, pageURL)
+	queue := extractStatsigScriptURLsN(pageHTML, pageURL, statsigMaxScriptDiscover)
 	seen := make(map[string]struct{}, len(queue)+8)
 	for _, raw := range queue {
 		seen[raw] = struct{}{}
 	}
-	fetched := make(map[string][]byte, len(queue))
+	fetched := make(map[string][]byte, 16)
 	moduleIDs := map[string]struct{}{}
 	enqueue := func(raw string, front bool) {
 		if raw == "" {
 			return
 		}
 		if _, exists := seen[raw]; exists {
+			return
+		}
+		if !front && len(seen) >= statsigMaxScriptDiscover {
 			return
 		}
 		seen[raw] = struct{}{}
@@ -315,21 +343,28 @@ func (c *Client) discoverStatsigIndices(ctx context.Context, pageHTML []byte, pa
 		}
 	}
 
-	for len(queue) > 0 && len(fetched) < statsigMaxScriptFetches {
+	if id := extractBotoxModuleID(string(pageHTML)); id != "" {
+		moduleIDs[id] = struct{}{}
+		mapChunks()
+	}
+
+	attempts := 0
+	for len(queue) > 0 && attempts < statsigMaxIndexScriptFetches {
 		raw := queue[0]
 		queue = queue[1:]
-		body, err := c.fetchStatsigScript(ctx, raw)
+		body, err := fetch(ctx, raw)
+		attempts++
 		if err != nil {
 			continue
 		}
 		fetched[raw] = body
 		if idx, ok := consider(body); ok {
-			return idx, true
+			return idx, attempts, true
 		}
-		for _, next := range extractStatsigScriptURLs(body, pageURL) {
+		for _, next := range extractStatsigScriptURLsN(body, pageURL, statsigMaxScriptDiscover) {
 			enqueue(next, false)
 		}
 		mapChunks()
 	}
-	return statsigByteIndices{}, false
+	return statsigByteIndices{}, attempts, false
 }

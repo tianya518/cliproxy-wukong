@@ -12,8 +12,15 @@ import (
 )
 
 const (
+	// 曲线扫描保持小预算：RSC 命中时根本不会走到脚本爬取。
 	statsigMaxScriptFetches = 32
-	statsigScriptBodyLimit  = 2 << 20
+	// 下标在懒加载签名器里。2026-08-29 的 /imagine 页面有 200+ 个 chunk 引用，
+	// 含 botoxSign 的入口排在第 60 名之后，模块映射表更靠后；32 条上限会让发现
+	// 永远停在默认值上。收集与抓取分开限额，避免把「页面里有多少 URL」和
+	// 「最多 GET 多少次」绑死。
+	statsigMaxScriptDiscover     = 512
+	statsigMaxIndexScriptFetches = 192
+	statsigScriptBodyLimit       = 2 << 20
 )
 
 var (
@@ -222,9 +229,19 @@ func (c *Client) fetchStatsigScript(ctx context.Context, rawURL string) ([]byte,
 }
 
 func extractStatsigScriptURLs(body []byte, pageURL string) []string {
+	return extractStatsigScriptURLsN(body, pageURL, statsigMaxScriptFetches)
+}
+
+func extractStatsigScriptURLsN(body []byte, pageURL string, limit int) []string {
+	if limit <= 0 {
+		limit = statsigMaxScriptDiscover
+	}
 	seen := make(map[string]struct{})
 	out := make([]string, 0, 16)
 	add := func(raw string) {
+		if len(out) >= limit {
+			return
+		}
 		resolved, ok := trustedStatsigScriptURL(raw, pageURL)
 		if !ok {
 			return
@@ -232,23 +249,29 @@ func extractStatsigScriptURLs(body []byte, pageURL string) []string {
 		if _, exists := seen[resolved]; exists {
 			return
 		}
-		if len(out) >= statsigMaxScriptFetches {
-			return
-		}
 		seen[resolved] = struct{}{}
 		out = append(out, resolved)
 	}
-	for _, match := range statsigAbsoluteScriptPattern.FindAllString(string(body), statsigMaxScriptFetches*2) {
+	for _, match := range statsigAbsoluteScriptPattern.FindAllString(string(body), -1) {
 		add(match)
+		if len(out) >= limit {
+			return out
+		}
 	}
-	for _, match := range statsigRelativeScriptPattern.FindAllStringSubmatch(string(body), statsigMaxScriptFetches*2) {
+	for _, match := range statsigRelativeScriptPattern.FindAllStringSubmatch(string(body), -1) {
 		if len(match) > 1 {
 			add(match[1])
 		}
+		if len(out) >= limit {
+			return out
+		}
 	}
-	for _, match := range statsigQuotedScriptPattern.FindAllStringSubmatch(string(body), statsigMaxScriptFetches*2) {
+	for _, match := range statsigQuotedScriptPattern.FindAllStringSubmatch(string(body), -1) {
 		if len(match) > 1 {
 			add(match[1])
+		}
+		if len(out) >= limit {
+			return out
 		}
 	}
 	return out
