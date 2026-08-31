@@ -20,11 +20,11 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	sdkapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/api"
 	sdkapihandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -69,13 +69,6 @@ func main() {
 	sentinelCfg := sentinelserver.LoadConfig()
 	sentinelCfg.BaseURL = gatewayBase
 
-	pool := sentinelserver.NewTokenPool(sentinelCfg.ChatGPTFile,
-		time.Duration(sentinelCfg.TokenRefreshAheadSec)*time.Second)
-	pool.SetOAuthConfig(sentinelCfg.OAuthTokenURL, sentinelCfg.OAuthClientID)
-	if sentinelCfg.RefreshLoopSec > 0 {
-		pool.StartRefreshLoop(time.Duration(sentinelCfg.RefreshLoopSec) * time.Second)
-	}
-
 	// 共用一个 SessionManager：executor 与产物路由必须看到同一批会话。
 	session := sentinelserver.NewSessionManager(&sentinelCfg)
 	engine := sentinelserver.NewEngine(&sentinelCfg, nil, session)
@@ -83,55 +76,58 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 官网模型目录同步，驱动 model 解析与对外模型列表。
-	sentinelserver.StartModelCatalogSync(&sentinelCfg, pool)
-
-	core := coreauth.NewManager(nil, nil, nil)
+	tokenStore := sdkAuth.NewFileTokenStore()
+	tokenStore.SetBaseDir(cfg.AuthDir)
+	core := coreauth.NewManager(tokenStore, nil, nil)
 	exec := glue.NewExecutor(engine, gatewayBase)
+	exec.SetOAuthConfig(sentinelCfg.OAuthTokenURL, sentinelCfg.OAuthClientID)
 	core.RegisterExecutor(exec)
+
+	// svc 在 Build 之后才有；运行时增删账号后要用它触发一次模型重注册。
+	var svc *sdkcliproxy.Service
+
 	grokCfg := grok.ConfigFromEnv()
 	if sentinelCfg.ProxyURL != "" {
 		grokCfg.ProxyURL = sentinelCfg.ProxyURL
 	}
-	grokStore := grok.NewAccountStore(sentinelCfg.GrokFile, grokCfg)
-	grokExec := glue.NewGrokExecutor(grokStore.ClientConfig())
+	grokAccounts := glue.NewGrokAccounts(core, cfg.AuthDir, grokCfg, func() {
+		if svc != nil {
+			svc.RefreshNativeProviderModels(glue.GrokProviderKey)
+		}
+	})
+	grokCfg.OnClearanceUpdate = grokAccounts.ApplyClearanceUpdate
+	grokExec := glue.NewGrokExecutor(grokCfg)
 	core.RegisterExecutor(grokExec)
 
 	// 把两条网页逆向注册为 cliproxy 的进程内原生 provider：executor 绑定与模型注册
 	// 从此走内置 provider 同款重载路径，config/auths 热重载中天然存活（见 cliproxy/models.go）。
 	glue.RegisterNativeProviders(exec, grokExec)
 
-	// svc 在 Build 之后才有；grok 运行时增删账号后要用它触发一次模型重注册。
-	var svc *sdkcliproxy.Service
-
-	registered, err := glue.RegisterAuthsFromChatGPTFile(ctx, core, sentinelCfg.ChatGPTFile)
+	chatgptAccounts := glue.NewChatGPTAccounts(core, cfg.AuthDir, func() {
+		if svc != nil {
+			svc.RefreshNativeProviderModels(glue.ProviderKey)
+		}
+	})
+	registered, err := chatgptAccounts.Load(ctx, sentinelCfg.ChatGPTFile)
 	if err != nil {
 		log.Fatalf("register chatgpt credentials: %v", err)
 	}
 	log.Printf("[startup] 已注册 %d 个 ChatGPT 凭证到 cliproxy 凭证池", registered)
 	if registered == 0 {
-		log.Printf("[startup] 警告：%s 里没有可用凭证，chatgpt-web 请求会因无凭证被拒", sentinelCfg.ChatGPTFile)
+		log.Printf("[startup] 警告：auth-dir 与 %s 里都没有可用凭证，可用 POST /chatgpt/upload 或 /v0/management/auth-files 灌号", sentinelCfg.ChatGPTFile)
 	}
-	grokStore.SetOnChange(func(accounts []grok.Credential) {
-		if err := glue.ReplaceGrokAuths(context.Background(), core, accounts); err != nil {
-			log.Printf("[grok] 同步 cliproxy 凭证失败: %v", err)
-			return
-		}
-		// 新增账号的模型不会自动注册，主动补一次。
-		if svc != nil {
-			svc.RefreshNativeProviderModels(glue.GrokProviderKey)
-		}
-	})
-	grokRegistered, err := glue.RegisterGrokAuths(ctx, core, grokStore.Snapshot())
+	// 官网模型目录同步，AT 从 Manager 取。无号时静默用静态表。
+	sentinelserver.StartModelCatalogSync(&sentinelCfg, chatgptAccounts.PickAccessToken)
+	grokRegistered, err := grokAccounts.Load(ctx, sentinelCfg.GrokFile)
 	if err != nil {
 		log.Fatalf("register grok credentials: %v", err)
 	}
-	if mode := grokStore.ClientConfig().ClearanceMode; mode != grok.ClearanceModeManual {
-		log.Printf("[startup] Grok Clearance mode=%s solver=%s", mode, grokStore.ClientConfig().FlareSolverrURL)
+	if mode := grokCfg.ClearanceMode; mode != grok.ClearanceModeManual {
+		log.Printf("[startup] Grok Clearance mode=%s solver=%s", mode, grokCfg.FlareSolverrURL)
 	}
 	log.Printf("[startup] 已注册 %d 个 Grok Web 凭证到 cliproxy 凭证池", grokRegistered)
 	if grokRegistered == 0 {
-		log.Printf("[startup] 提示：%s 里没有 Grok Web 账号，可用 POST /grok/upload 灌入", sentinelCfg.GrokFile)
+		log.Printf("[startup] 提示：auth-dir 与 %s 里都没有 Grok Web 账号，可用 POST /grok/upload 灌入", sentinelCfg.GrokFile)
 	}
 
 	svc, err = sdkcliproxy.NewBuilder().
@@ -143,7 +139,7 @@ func main() {
 			// 这些路由注册在根引擎、不进 cliproxy 的 api-key 鉴权组（图片链接要能被
 			// 末端客户端直接取）。cliproxy 无 /api/*、/images、/chatgpt、/grok，不冲突。
 			sdkapi.WithRouterConfigurator(func(ginEngine *gin.Engine, _ *sdkapihandlers.BaseAPIHandler, _ *sdkconfig.Config) {
-				sentinelserver.RegisterArtifactAndAdminRoutes(ginEngine, &sentinelCfg, pool, session, grokStore)
+				sentinelserver.RegisterArtifactAndAdminRoutes(ginEngine, &sentinelCfg, nil, session, nil, chatgptAccounts, grokAccounts)
 			}),
 		).
 		WithHooks(sdkcliproxy.Hooks{

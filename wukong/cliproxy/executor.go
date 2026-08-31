@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	clipexec "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -40,6 +41,20 @@ type Executor struct {
 	// wukong 自己的 HTTP 路由提供，这里指向那个地址，否则末端客户端拿到的
 	// 是取不到的相对路径。
 	artifactBaseURL string
+	oauthTokenURL   string
+	oauthClientID   string
+
+	refreshFromRefreshToken func(refreshToken, oauthURL, clientID string) (accessToken, newRefreshToken string, expiresAt time.Time, err error)
+	refreshFromSession      func(sessionToken string) (accessToken string, expiresAt time.Time, err error)
+}
+
+// SetOAuthConfig overrides the auth.openai.com endpoint used by Refresh.
+func (x *Executor) SetOAuthConfig(oauthURL, clientID string) {
+	if x == nil {
+		return
+	}
+	x.oauthTokenURL = strings.TrimSpace(oauthURL)
+	x.oauthClientID = strings.TrimSpace(clientID)
 }
 
 // NewExecutor 创建 executor。engine 与产物路由必须共用同一个 SessionManager，
@@ -222,9 +237,66 @@ func (x *Executor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, req c
 	}, nil
 }
 
-// Refresh 由 wukong 自己的凭证存储负责续期，这里无需动作。
+// Refresh renews the ChatGPT access token through cliproxy's conductor.
+// Prefer OAuth refresh_token; fall back to the web session token.
 func (x *Executor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	if auth == nil {
+		return nil, fmt.Errorf("%s: auth is nil", ProviderKey)
+	}
+	rt := metadataString(auth, "refresh_token", "refreshToken")
+	st := metadataString(auth, "session_token", "sessionToken")
+	if rt == "" && st == "" {
+		return auth, nil
+	}
+
+	refreshRT := x.refreshFromRefreshToken
+	if refreshRT == nil {
+		refreshRT = sentinelserver.RefreshATFromRefreshToken
+	}
+	refreshST := x.refreshFromSession
+	if refreshST == nil {
+		refreshST = sentinelserver.RefreshATFromSession
+	}
+
+	var (
+		at, newRT string
+		exp       time.Time
+		err       error
+	)
+	if rt != "" {
+		at, newRT, exp, err = refreshRT(rt, x.oauthTokenURL, x.oauthClientID)
+	} else {
+		at, exp, err = refreshST(st)
+	}
+	if err != nil {
+		return nil, err
+	}
+	applyChatGPTTokens(auth, at, newRT, st, exp)
 	return auth, nil
+}
+
+func applyChatGPTTokens(auth *coreauth.Auth, accessToken, newRefreshToken, sessionToken string, expiresAt time.Time) {
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["type"] = ProviderKey
+	if accessToken != "" {
+		auth.Metadata["access_token"] = accessToken
+		if auth.Attributes == nil {
+			auth.Attributes = make(map[string]string)
+		}
+		auth.Attributes["api_key"] = accessToken
+	}
+	if newRefreshToken != "" {
+		auth.Metadata["refresh_token"] = newRefreshToken
+	}
+	if sessionToken != "" {
+		auth.Metadata["session_token"] = sessionToken
+	}
+	if !expiresAt.IsZero() {
+		auth.Metadata["expired"] = expiresAt.UTC().Format(time.RFC3339)
+	}
+	auth.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
 }
 
 // CountTokens 网页端不暴露 token 计数接口。

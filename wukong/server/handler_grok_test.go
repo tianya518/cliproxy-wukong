@@ -21,7 +21,7 @@ func TestGrokUploadAndClear(t *testing.T) {
 	session := NewSessionManager(cfg)
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	RegisterArtifactAndAdminRoutes(r, cfg, pool, session, store)
+	RegisterArtifactAndAdminRoutes(r, cfg, pool, session, store, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/grok/upload", bytes.NewBufferString(`{"sso":"abc","name":"plus-1"}`))
 	req.Header.Set("Content-Type", "application/json")

@@ -20,7 +20,7 @@ func TestChatGPTRoutesAndTokensAlias(t *testing.T) {
 	store := grok.NewAccountStore(filepath.Join(t.TempDir(), "grok.json"), grok.Config{})
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	RegisterArtifactAndAdminRoutes(r, cfg, pool, session, store)
+	RegisterArtifactAndAdminRoutes(r, cfg, pool, session, store, nil, nil)
 
 	const jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhIn0.sigA"
 	req := httptest.NewRequest(http.MethodPost, "/chatgpt/upload", bytes.NewBufferString(`{"tokens":"`+jwt+`"}`))

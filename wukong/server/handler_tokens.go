@@ -10,16 +10,31 @@ import (
 type TokensHandler struct {
 	pool    *TokenPool
 	session *SessionManager
+	admin   ChatGPTAccountAdmin
 }
 
-// NewTokensHandler 创建 TokensHandler
-func NewTokensHandler(pool *TokenPool, session *SessionManager) *TokensHandler {
-	return &TokensHandler{pool: pool, session: session}
+// NewTokensHandler 创建 TokensHandler。admin 为 nil 时只写 TokenPool。
+func NewTokensHandler(pool *TokenPool, session *SessionManager, admin ChatGPTAccountAdmin) *TokensHandler {
+	return &TokensHandler{pool: pool, session: session, admin: admin}
+}
+
+func (h *TokensHandler) importChunks(chunks ...string) (int, error) {
+	if h.admin != nil {
+		return h.admin.Import(chunks)
+	}
+	return h.pool.Add(chunks...), nil
+}
+
+func (h *TokensHandler) stats() (total, valid, errored int) {
+	if h.admin != nil {
+		return h.admin.Stats()
+	}
+	return h.pool.Stats()
 }
 
 // HandleStatus 查看 ChatGPT 凭证池 GET /chatgpt（旧名 /tokens）
 func (h *TokensHandler) HandleStatus(c *gin.Context) {
-	total, valid, errored := h.pool.Stats()
+	total, valid, errored := h.stats()
 	c.JSON(http.StatusOK, gin.H{
 		"status":          "ok",
 		"provider":        "chatgpt-web",
@@ -39,7 +54,6 @@ func (h *TokensHandler) HandleUpload(c *gin.Context) {
 	var body struct {
 		Tokens string `json:"tokens" form:"text"`
 	}
-	// 尝试 JSON 解析，失败则用 form
 	if err := c.ShouldBindJSON(&body); err != nil {
 		_ = c.ShouldBind(&body)
 	}
@@ -51,9 +65,15 @@ func (h *TokensHandler) HandleUpload(c *gin.Context) {
 		return
 	}
 
-	added := h.pool.Add(splitUploadText(body.Tokens)...)
+	added, err := h.importChunks(splitUploadText(body.Tokens)...)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Error: ErrorDetail{Message: err.Error(), Type: "server_error"},
+		})
+		return
+	}
 
-	total, valid, _ := h.pool.Stats()
+	total, valid, _ := h.stats()
 	c.JSON(http.StatusOK, gin.H{
 		"status":       "success",
 		"provider":     "chatgpt-web",
@@ -73,8 +93,14 @@ func (h *TokensHandler) HandleAddSingle(c *gin.Context) {
 		return
 	}
 
-	added := h.pool.Add(token)
-	total, valid, _ := h.pool.Stats()
+	added, err := h.importChunks(token)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{
+			Error: ErrorDetail{Message: err.Error(), Type: "server_error"},
+		})
+		return
+	}
+	total, valid, _ := h.stats()
 	c.JSON(http.StatusOK, gin.H{
 		"status":       "success",
 		"provider":     "chatgpt-web",
@@ -86,7 +112,16 @@ func (h *TokensHandler) HandleAddSingle(c *gin.Context) {
 
 // HandleClear 清空 ChatGPT 凭证 POST /chatgpt/clear（旧名 /tokens/clear）
 func (h *TokensHandler) HandleClear(c *gin.Context) {
-	h.pool.Clear()
+	if h.admin != nil {
+		if err := h.admin.Clear(); err != nil {
+			c.JSON(http.StatusInternalServerError, ErrorResponse{
+				Error: ErrorDetail{Message: err.Error(), Type: "server_error"},
+			})
+			return
+		}
+	} else {
+		h.pool.Clear()
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"status":       "success",
 		"provider":     "chatgpt-web",
@@ -96,12 +131,17 @@ func (h *TokensHandler) HandleClear(c *gin.Context) {
 
 // HandleErrors 查看失效凭证 GET /chatgpt/errors（旧名 /tokens/errors）
 func (h *TokensHandler) HandleErrors(c *gin.Context) {
-	errTokens := h.pool.ErrorTokens()
+	var ids []string
+	if h.admin != nil {
+		ids = h.admin.ErrorIDs()
+	} else {
+		ids = h.pool.ErrorTokens()
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"status":       "success",
 		"provider":     "chatgpt-web",
-		"error_tokens": errTokens,
-		"count":        len(errTokens),
+		"error_tokens": ids,
+		"count":        len(ids),
 	})
 }
 
@@ -109,7 +149,12 @@ func (h *TokensHandler) HandleErrors(c *gin.Context) {
 // 含 Session 的会尝试换取 Access Token，仅 Access 的会探测存活；
 // 结果同步更新失效标记与刷新后的 Access Token。
 func (h *TokensHandler) HandleCheck(c *gin.Context) {
-	results := h.pool.CheckAll()
+	var results []TokenCheckResult
+	if h.admin != nil {
+		results = h.admin.CheckAll()
+	} else {
+		results = h.pool.CheckAll()
+	}
 	validCount := 0
 	for _, r := range results {
 		if r.Valid {

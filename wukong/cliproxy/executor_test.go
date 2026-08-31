@@ -1,9 +1,11 @@
 package cliproxy
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	clipexec "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -40,17 +42,17 @@ func TestAccessTokenFrom(t *testing.T) {
 			jwtB, true,
 		},
 		{
-			"metadata fallback",
+			"metadata access token",
 			&coreauth.Auth{Metadata: map[string]any{"accessToken": jwtC}},
 			jwtC, true,
 		},
 		{
-			"attribute wins over metadata",
+			"metadata wins over stale attribute",
 			&coreauth.Auth{
 				Attributes: map[string]string{"api_key": jwtA},
 				Metadata:   map[string]any{"access_token": jwtB},
 			},
-			jwtA, true,
+			jwtB, true,
 		},
 		{"no credential", &coreauth.Auth{ID: "empty"}, "", false},
 		// 非 JWT 值要尽早失败并给出明确原因，否则只会在上游收到一个含糊的 401。
@@ -284,6 +286,87 @@ func TestExecutorSatisfiesInterfaces(t *testing.T) {
 	}
 	if exec.Identifier() != ProviderKey {
 		t.Errorf("Identifier() = %q, 期望 %q", exec.Identifier(), ProviderKey)
+	}
+}
+
+func TestAccessTokenFromRefreshableWithoutATIsUnauthorized(t *testing.T) {
+	_, err := accessTokenFrom(&coreauth.Auth{
+		ID:       "chatgpt-web-rt",
+		Metadata: map[string]any{"refresh_token": "rt-1"},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var se clipexec.StatusError
+	if !errors.As(err, &se) || se.StatusCode() != 401 {
+		t.Fatalf("missing AT with refresh_token should be 401, got %T %v", err, err)
+	}
+}
+
+func TestRefreshChatGPTAuth(t *testing.T) {
+	exp := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	exec := NewExecutor(nil, "")
+	exec.refreshFromRefreshToken = func(rt, _, _ string) (string, string, time.Time, error) {
+		if rt != "old-rt" {
+			t.Fatalf("refresh token = %q", rt)
+		}
+		return jwtB, "new-rt", exp, nil
+	}
+
+	got, err := exec.Refresh(context.Background(), &coreauth.Auth{
+		ID:         "chatgpt-web-1",
+		Attributes: map[string]string{"api_key": jwtA},
+		Metadata:   map[string]any{"access_token": jwtA, "refresh_token": "old-rt"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata["access_token"] != jwtB || got.Metadata["refresh_token"] != "new-rt" {
+		t.Fatalf("metadata = %#v", got.Metadata)
+	}
+	if got.Attributes["api_key"] != jwtB {
+		t.Fatalf("api_key = %q", got.Attributes["api_key"])
+	}
+	if got.Metadata["expired"] != exp.Format(time.RFC3339) {
+		t.Fatalf("expired = %v", got.Metadata["expired"])
+	}
+	if _, err := accessTokenFrom(got); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRefreshChatGPTAuthFallsBackToSession(t *testing.T) {
+	exec := NewExecutor(nil, "")
+	exec.refreshFromSession = func(st string) (string, time.Time, error) {
+		if st != "st-1" {
+			t.Fatalf("session token = %q", st)
+		}
+		return jwtC, time.Time{}, nil
+	}
+	got, err := exec.Refresh(context.Background(), &coreauth.Auth{
+		Metadata: map[string]any{"session_token": "st-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata["access_token"] != jwtC {
+		t.Fatalf("access_token = %v", got.Metadata["access_token"])
+	}
+}
+
+func TestRefreshChatGPTAuthNoRefreshMaterial(t *testing.T) {
+	exec := NewExecutor(nil, "")
+	auth := &coreauth.Auth{Metadata: map[string]any{"access_token": jwtA}}
+	got, err := exec.Refresh(context.Background(), auth)
+	if err != nil || got != auth {
+		t.Fatalf("got %#v err=%v", got, err)
+	}
+}
+
+func TestRefreshLeadRegistered(t *testing.T) {
+	lead := coreauth.ProviderRefreshLead(ProviderKey, nil)
+	if lead == nil || *lead != chatgptWebRefreshLead {
+		t.Fatalf("chatgpt-web refresh lead = %v, want %s", lead, chatgptWebRefreshLead)
 	}
 }
 

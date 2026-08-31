@@ -110,6 +110,65 @@ func (tp *TokenPool) CheckAll() []TokenCheckResult {
 	return results
 }
 
+// CheckChatGPTCredential probes one credential. It does not persist.
+// Prefer OAuth refresh_token, then session token, then a live AT probe.
+func CheckChatGPTCredential(cred Credential) (TokenCheckResult, Credential) {
+	r := TokenCheckResult{
+		ID:         cred.ID,
+		HasAccess:  cred.AccessToken != "",
+		HasSession: cred.SessionToken != "",
+	}
+	switch {
+	case cred.RefreshToken != "":
+		at, newRT, exp, err := RefreshATFromRefreshToken(cred.RefreshToken, "", "")
+		if err != nil {
+			r.Valid = false
+			r.Error = err.Error()
+			return r, cred
+		}
+		r.Valid = true
+		r.Refreshed = true
+		r.HasAccess = true
+		r.ExpiresAt = exp
+		cred.AccessToken = at
+		cred.ExpiresAt = exp
+		if newRT != "" {
+			cred.RefreshToken = newRT
+		}
+	case cred.SessionToken != "":
+		at, exp, err := RefreshATFromSession(cred.SessionToken)
+		if err != nil {
+			r.Valid = false
+			r.Error = err.Error()
+			return r, cred
+		}
+		r.Valid = true
+		r.Refreshed = true
+		r.HasAccess = true
+		r.ExpiresAt = exp
+		cred.AccessToken = at
+		cred.ExpiresAt = exp
+	case cred.AccessToken != "":
+		exp := parseJWTExp(cred.AccessToken)
+		r.ExpiresAt = exp
+		if time.Now().After(exp) {
+			r.Valid = false
+			r.Error = "access token expired"
+			return r, cred
+		}
+		ok, note := probeAccessToken(cred.AccessToken)
+		r.Valid = ok
+		r.Note = note
+		if !ok && note != "" {
+			r.Error = note
+		}
+	default:
+		r.Valid = false
+		r.Error = "empty entry"
+	}
+	return r, cred
+}
+
 // probeAccessToken 用 Access Token 轻量探测存活。
 // 200 → 有效；401 → 失效；其它（含 Cloudflare 拦截）→ 无法确认，按有效处理并附注说明。
 func probeAccessToken(accessToken string) (bool, string) {

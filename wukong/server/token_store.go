@@ -81,10 +81,63 @@ func newStoredToken(accessToken, sessionToken, refreshToken string) storedToken 
 
 // Credential 是一条 ChatGPT 凭证的公开视图，供本模块之外的调用方（如 cliproxy 胶水层）使用。
 type Credential struct {
+	ID           string
 	AccessToken  string
 	SessionToken string
 	RefreshToken string
 	ExpiresAt    time.Time
+}
+
+// LoadChatGPTCredentials 读取 chatgpt.json（及旧行格式），返回结构化凭证。
+// 文件不存在时返回 os.IsNotExist，调用方按「尚未灌号」处理。
+func LoadChatGPTCredentials(path string) ([]Credential, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, os.ErrNotExist
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	tokens := loadTokensFromFile(path)
+	out := make([]Credential, 0, len(tokens))
+	for i := range tokens {
+		t := tokens[i]
+		t.assignID()
+		if t.AccessToken == "" && t.SessionToken == "" && t.RefreshToken == "" {
+			continue
+		}
+		out = append(out, Credential{
+			ID:           t.ID,
+			AccessToken:  t.AccessToken,
+			SessionToken: t.SessionToken,
+			RefreshToken: t.RefreshToken,
+			ExpiresAt:    t.ExpiresAt,
+		})
+	}
+	return out, nil
+}
+
+// ParseUploadCredentials 解析灌号粘贴文本（多行 token / session JSON）。
+func ParseUploadCredentials(raw string) []Credential {
+	chunks := splitUploadText(raw)
+	out := make([]Credential, 0, len(chunks))
+	for _, chunk := range chunks {
+		t, ok := parseCredentialInput(chunk)
+		if !ok {
+			continue
+		}
+		t.assignID()
+		if t.AccessToken == "" && t.SessionToken == "" && t.RefreshToken == "" {
+			continue
+		}
+		out = append(out, Credential{
+			ID:           t.ID,
+			AccessToken:  t.AccessToken,
+			SessionToken: t.SessionToken,
+			RefreshToken: t.RefreshToken,
+			ExpiresAt:    t.ExpiresAt,
+		})
+	}
+	return out
 }
 
 // ParseCredential 解析 ChatGPT 凭证文件支持的各种写法，返回结构化结果。
@@ -94,7 +147,9 @@ func ParseCredential(raw string) (Credential, bool) {
 	if !ok {
 		return Credential{}, false
 	}
+	t.assignID()
 	return Credential{
+		ID:           t.ID,
 		AccessToken:  t.AccessToken,
 		SessionToken: t.SessionToken,
 		RefreshToken: t.RefreshToken,

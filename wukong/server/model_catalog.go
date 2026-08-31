@@ -15,7 +15,7 @@ import (
 )
 
 // errNoTokenForCatalog 池内暂无可用凭证，拉取推迟到下一个周期。
-var errNoTokenForCatalog = errors.New("token pool is empty")
+var errNoTokenForCatalog = errors.New("no chatgpt-web access token")
 
 // catalogRefreshInterval 目录刷新间隔。官网模型阵容以周/月为单位变动，无需频繁拉取。
 const catalogRefreshInterval = 6 * time.Hour
@@ -24,13 +24,13 @@ const catalogRefreshInterval = 6 * time.Hour
 var modelsMu sync.RWMutex
 
 // StartModelCatalogSync 启动时拉取一次模型目录，随后定期刷新。
-// pool 为空或无可用凭证时静默跳过，服务继续用静态表。
-func StartModelCatalogSync(cfg *ServerConfig, pool *TokenPool) {
-	if pool == nil {
+// pickToken 为空或暂无可用 AT 时静默跳过，服务继续用静态表。
+func StartModelCatalogSync(cfg *ServerConfig, pickToken func() (string, bool)) {
+	if pickToken == nil {
 		return
 	}
 	refresh := func() {
-		if err := syncModelCatalog(cfg, pool); err != nil {
+		if err := syncModelCatalog(cfg, pickToken); err != nil {
 			log.Printf("[models] 目录同步失败（继续使用静态表）: %v", err)
 		}
 	}
@@ -44,9 +44,12 @@ func StartModelCatalogSync(cfg *ServerConfig, pool *TokenPool) {
 	}()
 }
 
-// syncModelCatalog 用池内任一凭证拉取目录并安装。
-func syncModelCatalog(cfg *ServerConfig, pool *TokenPool) error {
-	token, ok := pool.Pick()
+// syncModelCatalog 用任一可用 Access Token 拉取目录并安装。
+func syncModelCatalog(cfg *ServerConfig, pickToken func() (string, bool)) error {
+	if pickToken == nil {
+		return errNoTokenForCatalog
+	}
+	token, ok := pickToken()
 	if !ok {
 		return errNoTokenForCatalog
 	}

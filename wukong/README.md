@@ -38,8 +38,8 @@ go build -o scp.exe ./wukong/cliproxy/cmd/wukong-gateway
 cp wukong/cliproxy/config.example.yaml config.yaml
 
 $env:CLIPROXY_CONFIG = "config.yaml"
-$env:CHATGPT_FILE    = "chatgpt.json"   # ChatGPT 网页凭证池（旧名 tokens.json 仍可用）
-$env:GROK_FILE       = "grok.json"      # 可选；没有文件则 grok-web 不注册账号
+$env:CHATGPT_FILE    = "chatgpt.json"   # 仅启动时一次性迁到 auth-dir；日常灌号走 /chatgpt 或 management API
+$env:GROK_FILE       = "grok.json"      # 仅启动时一次性迁到 auth-dir；日常灌号走 /grok
 # 生图链接默认指向网关自身（config 的 host:port）。对外部署时设成末端可达地址：
 # $env:ARTIFACT_BASE_URL = "https://your.domain"
 ./scp.exe
@@ -57,17 +57,15 @@ $env:GROK_FILE       = "grok.json"      # 可选；没有文件则 grok-web 不�
 
 ## 账号池：现状与刷新蓝图
 
-**已统一。** `chatgpt.json` / `grok.json` 的账号启动时注册进 cliproxy 的凭证池，作为一个
+**已统一。** ChatGPT / Grok 账号启动时注册进 cliproxy 的凭证池，作为一个
 池子参与**轮换、冷却、失败重试**（已实测：上游 401 会对该凭证记冷却，其余继续服务；
 热重载后凭证与模型仍在）。
 
-**尚未统一（后续）。** 令牌**自动刷新**目前仍由 wukong 的 `TokenPool` 后台循环负责，与
-cliproxy 的 `coreManager` 是两份拷贝：AT 到期时 cliproxy 手里那份不会自动更新，需重启
-重载。要收口成一份，推荐 **auth-dir 单一存储**：把账号写成 cliproxy `auth-dir/*.json`，加
-一处 fork 钩子让 watcher 识别并解析成 `coreauth.Auth`，刷新交给 conductor——其本地 401
-刷新的唯一门控是 auth 的 `Metadata["refresh_token"]` 非空，命中后调 `executor.Refresh`
-（用 `wukong/server` 现成的 `RefreshATFromSession` / `RefreshATFromRefreshToken` 刷 AT）
-并装回重试。落地后启动加载、运行时灌号、轮换/冷却、刷新、持久化全走一条链。
+**灌号、状态口、模型目录都走 Manager / auth-dir。**
+`POST /chatgpt/upload` 写成 `auth-dir/chatgpt-web-<id>.json`，
+`POST /grok/upload` 写成 `auth-dir/grok-web-<id>.json`。
+启动时先读 auth-dir，再把旧的 `chatgpt.json` / `grok.json` 一次性迁过去。
+ChatGPT 刷新和 Grok Clearance 更新都写回同一目录。`grok-live` 仍可用 `-file` 直打协议。
 
 ## 跟进上游（fork 维护）
 

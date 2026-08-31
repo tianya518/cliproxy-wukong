@@ -107,6 +107,37 @@ func TestSaveLoadTokenJSON(t *testing.T) {
 	}
 }
 
+func TestLoadChatGPTCredentials(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "chatgpt.json")
+	at := "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjE3MDAwMDAwMDB9.sig"
+	if err := saveTokensToFile(path, []storedToken{newStoredToken(at, "", "rt-1")}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadChatGPTCredentials(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].AccessToken != at || got[0].RefreshToken != "rt-1" || got[0].ID == "" {
+		t.Fatalf("got %+v", got)
+	}
+	if _, err = LoadChatGPTCredentials(filepath.Join(dir, "missing.json")); !os.IsNotExist(err) {
+		t.Fatalf("missing file: %v", err)
+	}
+}
+
+func TestCheckChatGPTCredentialEmptyAndExpired(t *testing.T) {
+	r, _ := CheckChatGPTCredential(Credential{})
+	if r.Valid || r.Error != "empty entry" {
+		t.Fatalf("empty: %+v", r)
+	}
+	expired := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjEwMDAwMDAwMDB9.x"
+	r, _ = CheckChatGPTCredential(Credential{AccessToken: expired})
+	if r.Valid || r.Error != "access token expired" {
+		t.Fatalf("expired: %+v", r)
+	}
+}
+
 func TestParseJWTExp(t *testing.T) {
 	exp := parseJWTExp("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQxMDI0NDQ4MDB9.x")
 	if exp.Unix() != 4102444800 {
