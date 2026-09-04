@@ -28,7 +28,8 @@ type Client struct {
 
 func NewClient(cfg Config, cred Credential) *Client {
 	cfg = cfg.normalized()
-	c := &Client{cfg: cfg, cred: cred, statsig: newStatsigSigner()}
+	c := &Client{cfg: cfg, cred: cred}
+	c.statsig = sharedStatsigSigner(c.baseURL())
 	httpC := req.C().
 		SetBaseURL(c.baseURL()).
 		ImpersonateChrome().

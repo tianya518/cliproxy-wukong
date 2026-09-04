@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -83,6 +84,21 @@ func TestGrokAccountsImportWritesAuthDir(t *testing.T) {
 	}
 	if meta["type"] != GrokProviderKey || meta["sso_token"] != "sso-live" {
 		t.Fatalf("persisted %#v", meta)
+	}
+}
+
+// 面板按凭证文件刷新，Quota 的 id 要能同时认账号名、auth ID 和文件名。
+func TestGrokAuthMatchesAcceptsIDAndFileName(t *testing.T) {
+	cred := grok.Credential{SSOToken: "sso-live", Name: "plus-1"}
+	auth := newGrokAuth(cred, time.Now())
+	bindGrokAuthFile(auth, cred.ID(), t.TempDir())
+	for _, id := range []string{"plus-1", "PLUS-1", auth.ID, auth.FileName, "grok-web-plus-1.json"} {
+		if !grokAuthMatches(auth, cred, id) {
+			t.Fatalf("id %q should match auth %q / file %q", id, auth.ID, auth.FileName)
+		}
+	}
+	if grokAuthMatches(auth, cred, "other") {
+		t.Fatal("unrelated id must not match")
 	}
 }
 

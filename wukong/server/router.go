@@ -26,7 +26,8 @@ type GrokAccountAdmin interface {
 	Clear() error
 	Count() int
 	PublicAccounts() []grok.AccountPublic
-	CheckAll(ctx context.Context) []grok.AccountCheckResult
+	CheckAll(ctx context.Context, withQuota bool) []grok.AccountCheckResult
+	Quota(ctx context.Context, id string) []grok.AccountQuotaResult
 }
 
 // RegisterArtifactAndAdminRoutes 把产物代理与账号管理路由挂到给定路由器上。
@@ -55,6 +56,7 @@ func RegisterArtifactAndAdminRoutes(r gin.IRouter, cfg *ServerConfig, pool *Toke
 	r.POST("/grok/clear", grokH.HandleClear)
 	r.GET("/grok/add/:token", grokH.HandleAddSingle)
 	r.GET("/grok/check", grokH.HandleCheck)
+	r.GET("/grok/quota", grokH.HandleQuota)
 
 	// 产物代理与静态图片
 	chat := NewChatHandler(cfg, pool, session)

@@ -23,6 +23,7 @@
     │   └── cmd/e2e/                 # 对真实上游的端到端回归
     ├── cmd/grok-live/               # grok.com 联调工具（协议维护用）
     ├── cmd/stream-capture/          # SSE 抓流工具（协议维护用）
+    ├── panel/              # fork 版管理面板（management.html 内嵌进二进制）
     └── docs/                        # 协议抓包参考（IMAGE_FLOW_CAPTURE / PROTOCOL_BASELINE）
 ```
 
@@ -66,6 +67,52 @@ $env:GROK_FILE       = "grok.json"      # 仅启动时一次性迁到 auth-dir�
 `POST /grok/upload` 写成 `auth-dir/grok-web-<id>.json`。
 启动时先读 auth-dir，再把旧的 `chatgpt.json` / `grok.json` 一次性迁过去。
 ChatGPT 刷新和 Grok Clearance 更新都写回同一目录。`grok-live` 仍可用 `-file` 直打协议。
+
+**Grok 额度。** `GET /grok/quota` 拉全部账号的 grok.com 额度，`?id=<账号名或 auth-dir
+文件名>` 只拉一个。`GET /grok/check` 默认顺带带上，`?quota=0` 只验会话。每个账号两层：
+
+- `windows`：`/rest/rate-limits` 的 `auto` / `fast` 聊天滚动窗口（剩余 / 总数，平时没有重置
+  时间，只有被限流时上游才带 `waitTimeSeconds` → `reset_at`），加 `image` / `image_pro` /
+  `image_edit` / `video` / `video_720p` 的 Imagine 可用性标志。
+- `billing`：grok.com 设置页「使用量」那套订阅额度，即 `SuperGrok Heavy 周限额 6%` 那种数字。
+  走同源 gRPC-web（`grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig` +
+  `prod_mc_billing.ConsumerUiSvc/GetRemainingResets`，`grok/billing.go` 手写帧 + protowire 解码，
+  不需要 Statsig 签名）：`usage_percent` 是当期**已用**百分比，`period_type` / `period_end`
+  是周期与重置时刻，`products[]` 按产品线（imagine / chat / voice …）拆分，`resets[]` 是尚未
+  过期的「用量限额重置」券，`prepaid_balance_cents` 是额外额度余额。拿不到只填 `billing_error`，
+  不影响 `windows`。
+
+xAI 那张卡（Grok CLI OAuth）走的是 cli-chat-proxy 的账单口，和这里不是一套账号。
+
+## 管理面板（fork 版 CPAMC）
+
+网关服务的 `/management.html` 不是上游 release 里的那份，而是
+[Cli-Proxy-API-Management-Center](https://github.com/router-for-me/Cli-Proxy-API-Management-Center)
+的 fork 构建，多了 `grok-web` 的额度组件（`src/features/quota/providers/grok-web/`，调网关自己的
+`/grok/quota?id=<文件名>`），以及 `grok-web` / `chatgpt-web` 的显示名、图标、配色。
+
+构建产物 `wukong/panel/management.html` 通过 `go:embed` 随二进制发布。启动时 `panel.Install`
+把它写到 SDK 服务面板的 static 目录，并把 `remote-management.disable-auto-update-panel`
+钉成 true——上游更新器 3 小时一轮会用 release 的 hash 比对并覆盖本地文件，不钉住就会被
+换回不认识这两个 provider 的官方版。**config.yaml 里也要写上这个开关**（见
+`config.example.yaml`），否则热重载后内存里的钉子就没了；启动日志会提示。
+
+重建面板（前端源码在同级目录 `../Cli-Proxy-API-Management-Center`，需要 Node 22+）：
+
+```powershell
+cd ../Cli-Proxy-API-Management-Center
+npm install
+npx bun@1.3.14 test          # 上游测试用 bun:test，没装 bun 就用 npx 拉
+$env:VERSION = "wukong-" + (git rev-parse --short HEAD)
+npm run build  # 产物 dist/index.html（单文件）
+Copy-Item dist/index.html ../cliproxy-wukong/wukong/panel/management.html
+cd ../cliproxy-wukong && go test ./wukong/panel/ && go build -o scp.exe ./wukong/cliproxy/cmd/wukong-gateway
+```
+
+跟进上游面板：在 fork 里 `git rebase` 上游 main，冲突面集中在 6 个枚举点
+（`providers/types.ts`、`providers/index.ts`、`constants.ts` 的 `QUOTA_TAB_ORDER`、
+`logic.ts`、`QuotaPage.tsx`、`useQuotaStore.ts`）和 `authFiles/constants.ts` 的
+`QuotaProviderType`；`grok-web/` 目录本身是新文件不冲突。
 
 ## 跟进上游（fork 维护）
 

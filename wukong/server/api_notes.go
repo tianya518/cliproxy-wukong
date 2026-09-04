@@ -6,5 +6,5 @@ const (
 
 	NoteChatGPT = "/chatgpt 管理 ChatGPT 网页凭证，落盘 auth-dir/chatgpt-web-*.json。/tokens 是旧名，与这里完全等价。Grok 请走 /grok。"
 
-	NoteGrok = "/grok 管理 Grok.com 网页 SSO，落盘 auth-dir/grok-web-*.json。ChatGPT 请走 /chatgpt，不要把 JWT 贴到这里。"
+	NoteGrok = "/grok 管理 Grok.com 网页 SSO，落盘 auth-dir/grok-web-*.json。额度看 /grok/quota：windows 是 2 小时滚动窗口，billing 是订阅的周/月已用百分比与重置券；/grok/check 顺带带上（想只验会话用 /grok/check?quota=0）。ChatGPT 请走 /chatgpt，不要把 JWT 贴到这里。"
 )

@@ -139,7 +139,37 @@ func (s *GrokAccounts) PublicAccounts() []grok.AccountPublic {
 	return out
 }
 
-func (s *GrokAccounts) CheckAll(ctx context.Context) []grok.AccountCheckResult {
+// Quota 拉额度。id 为空拉全部；否则接受账号 ID、auth ID 或 auth-dir 文件名
+// （面板按凭证文件刷新，手里只有文件名）。
+func (s *GrokAccounts) Quota(ctx context.Context, id string) []grok.AccountQuotaResult {
+	if s == nil || s.mgr == nil {
+		return nil
+	}
+	var results []grok.AccountQuotaResult
+	s.each(func(auth *coreauth.Auth) {
+		cred, err := grokCredentialFrom(auth)
+		if id != "" && !grokAuthMatches(auth, cred, id) {
+			return
+		}
+		if err != nil {
+			results = append(results, grok.AccountQuotaResult{ID: auth.ID, Error: err.Error()})
+			return
+		}
+		results = append(results, grok.QuotaFor(ctx, s.cfg, cred))
+	})
+	return results
+}
+
+func grokAuthMatches(auth *coreauth.Auth, cred grok.Credential, id string) bool {
+	for _, candidate := range []string{cred.ID(), auth.ID, auth.FileName} {
+		if candidate != "" && strings.EqualFold(candidate, id) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *GrokAccounts) CheckAll(ctx context.Context, withQuota bool) []grok.AccountCheckResult {
 	if s == nil || s.mgr == nil {
 		return nil
 	}
@@ -176,6 +206,9 @@ func (s *GrokAccounts) CheckAll(ctx context.Context) []grok.AccountCheckResult {
 			applyGrokCredential(auth, cred)
 		}
 		_, _ = s.mgr.Update(ctx, auth)
+		if withQuota {
+			result.AttachQuota(ctx, s.cfg, cred)
+		}
 		results = append(results, result)
 	})
 	return results

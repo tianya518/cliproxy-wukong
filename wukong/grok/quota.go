@@ -24,7 +24,45 @@ type QuotaSnapshot struct {
 	SyncedAt time.Time     `json:"synced_at"`
 }
 
+// AccountQuotaResult 是单个账号的额度快照。批量查询时单个账号失败只记 Error，不中断整批。
+// Windows 是 /rest/rate-limits 的滚动窗口；Billing 是订阅层面的周/月额度，拿不到只记 BillingError。
+type AccountQuotaResult struct {
+	ID           string           `json:"id"`
+	Name         string           `json:"name,omitempty"`
+	Tier         Tier             `json:"tier,omitempty"`
+	Windows      []QuotaWindow    `json:"windows,omitempty"`
+	Billing      *BillingSnapshot `json:"billing,omitempty"`
+	BillingError string           `json:"billing_error,omitempty"`
+	SyncedAt     *time.Time       `json:"synced_at,omitempty"`
+	Error        string           `json:"error,omitempty"`
+}
+
+// QuotaFor 取单个账号的额度快照。
+func QuotaFor(ctx context.Context, cfg Config, cred Credential) AccountQuotaResult {
+	result := AccountQuotaResult{ID: cred.ID(), Name: cred.Name, Tier: cred.WebTier()}
+	client := NewClient(cfg, cred)
+	snapshot, err := client.SyncQuota(ctx)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	synced := snapshot.SyncedAt
+	result.Tier = snapshot.Tier
+	result.Windows = snapshot.Windows
+	result.SyncedAt = &synced
+	if billing, billingErr := client.SyncBilling(ctx); billingErr != nil {
+		result.BillingError = billingErr.Error()
+	} else {
+		result.Billing = &billing
+	}
+	return result
+}
+
 func (c *Client) SyncQuota(ctx context.Context) (QuotaSnapshot, error) {
+	// 冷启动的 Statsig 材料抓取（实测 30s+）单独预热，不占每次额度 POST 的 25s 预算。
+	if err := c.warmStatsig(ctx); err != nil {
+		return QuotaSnapshot{}, err
+	}
 	windows := make([]QuotaWindow, 0, 6)
 	for _, mode := range []string{"auto", "fast"} {
 		window, err := c.SyncQuotaMode(ctx, mode)
@@ -59,25 +97,48 @@ func (c *Client) SyncQuotaMode(ctx context.Context, mode string) (QuotaWindow, e
 		return QuotaWindow{}, fmt.Errorf("Grok Web 额度接口返回 %d", resp.StatusCode)
 	}
 	var value struct {
-		WindowSizeSeconds int `json:"windowSizeSeconds"`
-		RemainingQueries  int `json:"remainingQueries"`
-		TotalQueries      int `json:"totalQueries"`
+		WindowSizeSeconds int  `json:"windowSizeSeconds"`
+		RemainingQueries  *int `json:"remainingQueries"`
+		RemainingTokens   *int `json:"remainingTokens"`
+		TotalQueries      *int `json:"totalQueries"`
+		TotalTokens       *int `json:"totalTokens"`
+		WaitTimeSeconds   *int `json:"waitTimeSeconds"`
 	}
 	if err := json.Unmarshal(body, &value); err != nil {
 		return QuotaWindow{}, err
 	}
-	if value.TotalQueries <= 0 {
-		return QuotaWindow{}, fmt.Errorf("Grok Web 额度响应缺少 totalQueries")
+	// 官网改版后 remainingQueries/totalQueries 有可能换成 *Tokens 命名，两套都认。
+	remaining := firstNonNilInt(value.RemainingQueries, value.RemainingTokens)
+	total := firstNonNilInt(value.TotalQueries, value.TotalTokens)
+	if remaining == nil && total == nil {
+		return QuotaWindow{}, fmt.Errorf("Grok Web 额度响应缺少 remainingQueries/totalQueries")
 	}
 	if value.WindowSizeSeconds <= 0 {
 		value.WindowSizeSeconds = 7200
 	}
-	now := time.Now().UTC()
-	resetAt := now.Add(time.Duration(value.WindowSizeSeconds) * time.Second)
-	return QuotaWindow{
-		Mode: mode, Remaining: max(0, value.RemainingQueries), Total: value.TotalQueries,
-		WindowSeconds: value.WindowSizeSeconds, ResetAt: &resetAt,
-	}, nil
+	window := QuotaWindow{Mode: mode, WindowSeconds: value.WindowSizeSeconds}
+	if remaining != nil {
+		window.Remaining = max(0, *remaining)
+	}
+	if total != nil {
+		window.Total = max(0, *total)
+	}
+	// 上游平时不给重置时间（滚动窗口也算不出来），只有被限流时才带 waitTimeSeconds。
+	// 之前用 now+windowSize 硬造一个，满额度也显示"2 小时后重置"，是误导。
+	if value.WaitTimeSeconds != nil && *value.WaitTimeSeconds > 0 {
+		resetAt := time.Now().UTC().Add(time.Duration(*value.WaitTimeSeconds) * time.Second)
+		window.ResetAt = &resetAt
+	}
+	return window, nil
+}
+
+func firstNonNilInt(values ...*int) *int {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }
 
 type imagineQuotaProduct struct {
@@ -111,6 +172,7 @@ func (c *Client) SyncImagineQuota(ctx context.Context) ([]QuotaWindow, error) {
 		field string
 		mode  string
 	}{
+		{"image", "image"},
 		{"imagePro", "image_pro"},
 		{"imageEdit", "image_edit"},
 		{"video", "video"},

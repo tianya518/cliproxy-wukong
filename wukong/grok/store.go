@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 )
 
@@ -160,15 +161,46 @@ func (s *AccountStore) Clear() error {
 }
 
 type AccountCheckResult struct {
-	ID     string `json:"id"`
-	Name   string `json:"name,omitempty"`
-	Valid  bool   `json:"valid"`
-	UserID string `json:"user_id,omitempty"`
-	Email  string `json:"email,omitempty"`
-	Error  string `json:"error,omitempty"`
+	ID           string           `json:"id"`
+	Name         string           `json:"name,omitempty"`
+	Valid        bool             `json:"valid"`
+	UserID       string           `json:"user_id,omitempty"`
+	Email        string           `json:"email,omitempty"`
+	Tier         Tier             `json:"tier,omitempty"`
+	Windows      []QuotaWindow    `json:"windows,omitempty"`
+	Billing      *BillingSnapshot `json:"billing,omitempty"`
+	BillingError string           `json:"billing_error,omitempty"`
+	QuotaError   string           `json:"quota_error,omitempty"`
+	Error        string           `json:"error,omitempty"`
 }
 
-func (s *AccountStore) CheckAll(ctx context.Context) []AccountCheckResult {
+// AttachQuota 在会话有效时补一次额度。额度失败不影响 valid 判定。
+func (r *AccountCheckResult) AttachQuota(ctx context.Context, cfg Config, cred Credential) {
+	quota := QuotaFor(ctx, cfg, cred)
+	r.Tier = quota.Tier
+	r.Windows = quota.Windows
+	r.Billing = quota.Billing
+	r.BillingError = quota.BillingError
+	r.QuotaError = quota.Error
+}
+
+// Quota 拉额度。id 为空拉全部；否则只拉 ID 匹配的那个账号。
+func (s *AccountStore) Quota(ctx context.Context, id string) []AccountQuotaResult {
+	if s == nil {
+		return nil
+	}
+	accounts := s.Snapshot()
+	results := make([]AccountQuotaResult, 0, len(accounts))
+	for _, account := range accounts {
+		if id != "" && !strings.EqualFold(account.ID(), id) {
+			continue
+		}
+		results = append(results, QuotaFor(ctx, s.cfg, account))
+	}
+	return results
+}
+
+func (s *AccountStore) CheckAll(ctx context.Context, withQuota bool) []AccountCheckResult {
 	if s == nil {
 		return nil
 	}
@@ -196,6 +228,9 @@ func (s *AccountStore) CheckAll(ctx context.Context) []AccountCheckResult {
 		if identity.Email != "" && account.Email != identity.Email {
 			account.Email = identity.Email
 			changed = true
+		}
+		if withQuota {
+			result.AttachQuota(ctx, s.cfg, account)
 		}
 		updated = append(updated, account)
 		results = append(results, result)

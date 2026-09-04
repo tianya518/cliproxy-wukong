@@ -18,3 +18,6 @@ debug: false
 remote-management:
   allow-remote: false
   secret-key: ""
+  # wukong 自带 fork 版管理面板（认识 chatgpt-web / grok-web 的额度）。
+  # 必须为 true，否则上游更新器会在 3 小时内把面板换回不认识这两个 provider 的官方版。
+  disable-auto-update-panel: true

@@ -31,6 +31,7 @@ import (
 
 	glue "github.com/router-for-me/CLIProxyAPI/v7/wukong/cliproxy"
 	"github.com/router-for-me/CLIProxyAPI/v7/wukong/grok"
+	"github.com/router-for-me/CLIProxyAPI/v7/wukong/panel"
 	sentinelserver "github.com/router-for-me/CLIProxyAPI/v7/wukong/server"
 )
 
@@ -55,6 +56,22 @@ func main() {
 			log.Fatal(err)
 		}
 		return
+	}
+
+	// 用 fork 版管理面板替换上游拉下来的那份：上游面板不认识 chatgpt-web / grok-web，
+	// 额度区块渲不出来。Install 会钉住 disable-auto-update-panel，否则 3 小时一轮的
+	// 上游更新器会把文件换回去。
+	if installed, errPanel := panel.Install(cfgPath, cfg); errPanel != nil {
+		log.Printf("[startup] 警告：管理面板安装失败，将回退到上游面板: %v", errPanel)
+	} else if installed.Path != "" {
+		state := "已是最新"
+		if installed.Written {
+			state = "已写入"
+		}
+		log.Printf("[startup] 管理面板 %s → %s (sha256 %s…)", state, installed.Path, installed.Hash[:12])
+		if installed.ConfigMissingPin {
+			log.Printf("[startup] 提示：%s 里没有 remote-management.disable-auto-update-panel: true，热重载后上游更新器可能覆盖定制面板，建议加上", cfgPath)
+		}
 	}
 
 	// 生图/产物链接指向网关自身（单一入口）。默认用 config 的 host:port 推断；

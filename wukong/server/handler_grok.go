@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -103,7 +104,8 @@ func (h *GrokHandler) HandleClear(c *gin.Context) {
 }
 
 func (h *GrokHandler) HandleCheck(c *gin.Context) {
-	results := h.checkAll(c.Request.Context())
+	withQuota := boolQuery(c, "quota", true)
+	results := h.checkAll(c.Request.Context(), withQuota)
 	valid := 0
 	for _, result := range results {
 		if result.Valid {
@@ -117,6 +119,33 @@ func (h *GrokHandler) HandleCheck(c *gin.Context) {
 		"valid":    valid,
 		"invalid":  len(results) - valid,
 		"results":  results,
+	})
+}
+
+// HandleQuota 只拉额度，不验会话。?id= 可指定单个账号（账号 ID / auth-dir 文件名），
+// 面板按凭证文件刷新时用。/grok/check 会顺带带上同样的额度字段。
+func (h *GrokHandler) HandleQuota(c *gin.Context) {
+	id := strings.TrimSpace(c.Query("id"))
+	results := h.quota(c.Request.Context(), id)
+	if id != "" && len(results) == 0 {
+		c.JSON(http.StatusNotFound, ErrorResponse{
+			Error: ErrorDetail{Message: "grok-web account not found: " + id, Type: "not_found"},
+		})
+		return
+	}
+	ok := 0
+	for _, result := range results {
+		if result.Error == "" {
+			ok++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "success",
+		"provider": "grok-web",
+		"total":    len(results),
+		"ok":       ok,
+		"failed":   len(results) - ok,
+		"accounts": results,
 	})
 }
 
@@ -144,14 +173,37 @@ func (h *GrokHandler) clear() error {
 	return h.store.Clear()
 }
 
-func (h *GrokHandler) checkAll(ctx context.Context) []grok.AccountCheckResult {
+func (h *GrokHandler) checkAll(ctx context.Context, withQuota bool) []grok.AccountCheckResult {
 	if h.admin != nil {
-		return h.admin.CheckAll(ctx)
+		return h.admin.CheckAll(ctx, withQuota)
 	}
 	if h.store != nil {
-		return h.store.CheckAll(ctx)
+		return h.store.CheckAll(ctx, withQuota)
 	}
 	return nil
+}
+
+func (h *GrokHandler) quota(ctx context.Context, id string) []grok.AccountQuotaResult {
+	if h.admin != nil {
+		return h.admin.Quota(ctx, id)
+	}
+	if h.store != nil {
+		return h.store.Quota(ctx, id)
+	}
+	return nil
+}
+
+// boolQuery 解析 ?key=0/false/no 之类的开关，缺省返回 def。
+func boolQuery(c *gin.Context, key string, def bool) bool {
+	raw := strings.TrimSpace(c.Query(key))
+	if raw == "" {
+		return def
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return def
+	}
+	return value
 }
 
 func firstNonEmptyForm(c *gin.Context, keys ...string) string {

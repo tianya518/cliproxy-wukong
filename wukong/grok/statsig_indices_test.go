@@ -2,13 +2,16 @@ package grok
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestExtractStatsigByteIndicesFromLiveHelperForm(t *testing.T) {
@@ -142,6 +145,90 @@ func TestDiscoverStatsigIndicesFromLazySigner(t *testing.T) {
 	}
 	if signerHits == 0 {
 		t.Fatal("lazy signer chunk was not fetched")
+	}
+}
+
+// 材料与账号无关：同一站点的多个 Client（QuotaFor/CheckAll 每次都 new 一个）必须共用一份缓存，
+// 并发冷启动只允许抓一次页面，等不及的调用方退出后抓取仍要完成并填入缓存。
+func TestStatsigMaterialsSharedAcrossClientsAndSingleFlight(t *testing.T) {
+	meta := "N2TClog28dgNkB/DTx4dTDMVMyD7ciQ0TvBshBKifYegVKBZpoLYwhF1lGRrZlzF"
+	html := `<html><head><meta name="grok-site-verification" content="` + meta + `"/></head><body>` +
+		`<script>self.__next_f.push([1,"{\"curves\":` + escapeStatsigJSString(string(botoxCurvesLiveFixture)) + `}"])</script>` +
+		`</body></html>`
+	var (
+		mu        sync.Mutex
+		pageHits  int
+		release   = make(chan struct{})
+		firstSeen = make(chan struct{}, 1)
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		pageHits++
+		mu.Unlock()
+		select {
+		case firstSeen <- struct{}{}:
+		default:
+		}
+		<-release
+		_, _ = writer.Write([]byte(html))
+	}))
+	defer server.Close()
+	cfg := Config{BaseURL: server.URL, StatsigMode: StatsigModeLocal}
+
+	// 两个全新 Client 同时冷启动，其中一个 deadline 很短。
+	impatient := NewClient(cfg, Credential{SSOToken: "sso-a"})
+	patient := NewClient(cfg, Credential{SSOToken: "sso-b"})
+	if impatient.statsig != patient.statsig {
+		t.Fatal("clients for the same base URL must share one statsig signer")
+	}
+	if NewClient(Config{BaseURL: server.URL + "/other"}, Credential{}).statsig == patient.statsig {
+		t.Fatal("different base URL must not share the signer")
+	}
+
+	shortCtx, cancelShort := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelShort()
+	_, err := impatient.statsigMaterials(shortCtx)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("impatient caller should time out waiting, got %v", err)
+	}
+	<-firstSeen
+
+	type result struct {
+		materials statsigPageMaterials
+		err       error
+	}
+	done := make(chan result, 1)
+	go func() {
+		materials, loadErr := patient.statsigMaterials(context.Background())
+		done <- result{materials, loadErr}
+	}()
+	time.Sleep(50 * time.Millisecond) // 让 patient 排进同一趟 flight
+	close(release)
+
+	got := <-done
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if got.materials.animationKey == "" {
+		t.Fatal("materials should be fully built")
+	}
+	mu.Lock()
+	hits := pageHits
+	mu.Unlock()
+	if hits != 1 {
+		t.Fatalf("page fetched %d times, want exactly 1 (singleflight + shared cache)", hits)
+	}
+
+	// 抓取脱离了 impatient 的 deadline：结果留在共享缓存里，第三个全新 Client 直接命中，不再请求页面。
+	third := NewClient(cfg, Credential{SSOToken: "sso-c"})
+	if _, err := third.statsigMaterials(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	hits = pageHits
+	mu.Unlock()
+	if hits != 1 {
+		t.Fatalf("cached materials should serve the third client, page hits = %d", hits)
 	}
 }
 

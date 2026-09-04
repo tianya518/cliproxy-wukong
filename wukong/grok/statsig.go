@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"golang.org/x/net/html"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -25,17 +26,41 @@ const (
 	statsigMetaBodyLimit       = 4 << 20
 	statsigResponseLimit       = 4 << 10
 	statsigSignerClientTimeout = 12 * time.Second
+	// 冷启动要翻几十甚至上百个 _next chunk 才能找到字节下标，实测 30s 上下；
+	// 这是脱离调用方 deadline 之后的兜底上限。
+	statsigDiscoveryBudget = 3 * time.Minute
 )
 
 var errStatsigMetaMissing = fmt.Errorf("Grok index 缺少 grok-site-verification")
 
 type statsigSigner struct {
 	mu           sync.Mutex
+	flight       singleflight.Group
 	materials    *statsigPageMaterials
 	source       string
 	scripts      int
 	indices      statsigByteIndices
 	indicesUntil time.Time
+}
+
+var (
+	statsigSignersMu sync.Mutex
+	statsigSigners   = map[string]*statsigSigner{}
+)
+
+// sharedStatsigSigner 按站点复用签名材料。页面 meta、Botox 曲线、字节下标都由 grok.com
+// 的前端构建决定，跟账号无关；以前每个 Client 各爬一遍，QuotaFor/CheckAll 每次 new 一个
+// Client 就每次冷启动，25s 的额度预算全烧在签名上，真正的 POST 反而超时。
+func sharedStatsigSigner(baseURL string) *statsigSigner {
+	key := strings.ToLower(strings.TrimRight(strings.TrimSpace(baseURL), "/"))
+	statsigSignersMu.Lock()
+	defer statsigSignersMu.Unlock()
+	if signer, ok := statsigSigners[key]; ok {
+		return signer
+	}
+	signer := newStatsigSigner()
+	statsigSigners[key] = signer
+	return signer
 }
 
 type StatsigInspect struct {
@@ -320,15 +345,59 @@ func validateStatsigSignerURL(value string) error {
 	return errors.New("公网签名 URL 必须使用 HTTPS:443；HTTP 和自定义端口仅允许内网地址")
 }
 
+func (s *statsigSigner) cachedMaterials() (statsigPageMaterials, bool) {
+	if s == nil {
+		return statsigPageMaterials{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.materials != nil && time.Now().Before(s.materials.expiresAt) {
+		return *s.materials, true
+	}
+	return statsigPageMaterials{}, false
+}
+
+// warmStatsig 把冷启动的材料抓取提前做掉，让后面每个签名请求各自的超时只管自己那次 POST。
+// 手动模式没有材料可抓；允许远程签名时本地失败也不算错，signStatsig 会自己回退。
+func (c *Client) warmStatsig(ctx context.Context) error {
+	if strings.EqualFold(c.cfg.StatsigMode, StatsigModeManual) {
+		return nil
+	}
+	warmCtx, cancel := context.WithTimeout(ctx, c.cfg.ChatTimeout)
+	defer cancel()
+	if _, err := c.statsigMaterials(warmCtx); err != nil && !c.statsigAllowsRemote() {
+		return err
+	}
+	return nil
+}
+
 func (c *Client) statsigMaterials(ctx context.Context) (statsigPageMaterials, error) {
-	c.statsig.mu.Lock()
-	if c.statsig.materials != nil && time.Now().Before(c.statsig.materials.expiresAt) {
-		materials := *c.statsig.materials
-		c.statsig.mu.Unlock()
+	if materials, ok := c.statsig.cachedMaterials(); ok {
 		return materials, nil
 	}
-	c.statsig.mu.Unlock()
+	// 冷加载走 singleflight 并脱离调用方 deadline：同一时刻的多个额度/聊天请求只爬一遍；
+	// 等不及先走的调用方不会把爬取一起取消，爬完照样填缓存，下一次直接命中。
+	ch := c.statsig.flight.DoChan("materials", func() (any, error) {
+		loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), statsigDiscoveryBudget)
+		defer cancel()
+		return c.loadStatsigMaterials(loadCtx)
+	})
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return statsigPageMaterials{}, res.Err
+		}
+		return res.Val.(statsigPageMaterials), nil
+	case <-ctx.Done():
+		return statsigPageMaterials{}, fmt.Errorf("Statsig 签名材料仍在抓取（首次约需半分钟，稍后重试即可）: %w", ctx.Err())
+	}
+}
 
+func (c *Client) loadStatsigMaterials(ctx context.Context) (statsigPageMaterials, error) {
+	// 排队拿到 flight 时前一轮可能刚把缓存填好。
+	if materials, ok := c.statsig.cachedMaterials(); ok {
+		return materials, nil
+	}
 	meta, body, pagePath, pageHTML, err := c.loadStatsigPageMaterials(ctx)
 	if err != nil && c.clearanceEnabled() && c.ensureClearance(ctx, true) == nil {
 		c.statsig.invalidate()
