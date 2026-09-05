@@ -35,6 +35,10 @@ func (h *TokensHandler) stats() (total, valid, errored int) {
 // HandleStatus 查看 ChatGPT 凭证池 GET /chatgpt（旧名 /tokens）
 func (h *TokensHandler) HandleStatus(c *gin.Context) {
 	total, valid, errored := h.stats()
+	activeSessions := 0
+	if h.session != nil {
+		activeSessions = h.session.Count()
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"status":          "ok",
 		"provider":        "chatgpt-web",
@@ -43,7 +47,8 @@ func (h *TokensHandler) HandleStatus(c *gin.Context) {
 		"total":           total,
 		"valid":           valid,
 		"error":           errored,
-		"active_sessions": h.session.Count(),
+		"active_sessions": activeSessions,
+		"catalog":         CatalogStatus(),
 	})
 }
 

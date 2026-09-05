@@ -269,6 +269,11 @@ func (x *Executor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Au
 		at, exp, err = refreshST(st)
 	}
 	if err != nil {
+		if current, atErr := accessTokenFrom(auth); atErr == nil && current != "" {
+			if _, fresh := sentinelserver.AccessTokenFresh(current, time.Now()); fresh {
+				return auth, nil
+			}
+		}
 		return nil, err
 	}
 	applyChatGPTTokens(auth, at, newRT, st, exp)

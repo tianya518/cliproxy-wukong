@@ -24,8 +24,8 @@ type TokenCheckResult struct {
 }
 
 // CheckAll 主动检测池内每条凭证是否可用：
-//   - 含 Session Token：用它换取 Access Token（成功即有效，并顺带刷新 AT）。
-//   - 仅 Access Token：先看是否过期，再探测 /backend-api/me。
+//   - Access Token 未过期：直接视为有效，不去 chatgpt.com 换票。
+//   - AT 过期或缺失：再用 refresh_token / session token 换新 AT。
 //
 // 检测结果会同步更新 errorKeys（有效则解封，失效则标记），并持久化刷新后的 AT。
 func (tp *TokenPool) CheckAll() []TokenCheckResult {
@@ -48,38 +48,21 @@ func (tp *TokenPool) CheckAll() []TokenCheckResult {
 			HasSession: e.SessionToken != "",
 		}
 
-		switch {
-		case e.SessionToken != "":
-			at, exp, err := RefreshATFromSession(e.SessionToken)
-			if err != nil {
-				r.Valid = false
-				r.Error = err.Error()
-			} else {
-				r.Valid = true
-				r.Refreshed = true
-				r.ExpiresAt = exp
-				e.AccessToken = at
-				e.ExpiresAt = exp
-				e.UpdatedAt = time.Now()
-				refreshed[key] = e
-			}
-		case e.AccessToken != "":
-			exp := parseJWTExp(e.AccessToken)
-			r.ExpiresAt = exp
-			if time.Now().After(exp) {
-				r.Valid = false
-				r.Error = "access token expired"
-			} else {
-				ok, note := probeAccessToken(e.AccessToken)
-				r.Valid = ok
-				r.Note = note
-				if !ok && note != "" {
-					r.Error = note
-				}
-			}
-		default:
-			r.Valid = false
-			r.Error = "empty entry"
+		result, updated := CheckChatGPTCredential(Credential{
+			ID:           e.ID,
+			AccessToken:  e.AccessToken,
+			SessionToken: e.SessionToken,
+			RefreshToken: e.RefreshToken,
+			ExpiresAt:    e.ExpiresAt,
+		})
+		r = result
+		if result.Valid && result.Refreshed {
+			e.AccessToken = updated.AccessToken
+			e.RefreshToken = updated.RefreshToken
+			e.SessionToken = updated.SessionToken
+			e.ExpiresAt = updated.ExpiresAt
+			e.UpdatedAt = time.Now()
+			refreshed[key] = e
 		}
 
 		if key != "" {
@@ -111,13 +94,22 @@ func (tp *TokenPool) CheckAll() []TokenCheckResult {
 }
 
 // CheckChatGPTCredential probes one credential. It does not persist.
-// Prefer OAuth refresh_token, then session token, then a live AT probe.
+// A still-valid access token from /api/auth/session is used as-is.
+// Session / OAuth refresh only runs when the AT is missing or expired.
 func CheckChatGPTCredential(cred Credential) (TokenCheckResult, Credential) {
 	r := TokenCheckResult{
 		ID:         cred.ID,
 		HasAccess:  cred.AccessToken != "",
 		HasSession: cred.SessionToken != "",
 	}
+	if exp, ok := AccessTokenFresh(cred.AccessToken, time.Now()); ok {
+		r.Valid = true
+		r.HasAccess = true
+		r.ExpiresAt = exp
+		cred.ExpiresAt = exp
+		return r, cred
+	}
+
 	switch {
 	case cred.RefreshToken != "":
 		at, newRT, exp, err := RefreshATFromRefreshToken(cred.RefreshToken, "", "")
@@ -151,17 +143,8 @@ func CheckChatGPTCredential(cred Credential) (TokenCheckResult, Credential) {
 	case cred.AccessToken != "":
 		exp := parseJWTExp(cred.AccessToken)
 		r.ExpiresAt = exp
-		if time.Now().After(exp) {
-			r.Valid = false
-			r.Error = "access token expired"
-			return r, cred
-		}
-		ok, note := probeAccessToken(cred.AccessToken)
-		r.Valid = ok
-		r.Note = note
-		if !ok && note != "" {
-			r.Error = note
-		}
+		r.Valid = false
+		r.Error = "access token expired"
 	default:
 		r.Valid = false
 		r.Error = "empty entry"

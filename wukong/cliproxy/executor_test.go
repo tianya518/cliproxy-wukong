@@ -3,6 +3,7 @@ package cliproxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -332,6 +333,23 @@ func TestRefreshChatGPTAuth(t *testing.T) {
 	}
 	if _, err := accessTokenFrom(got); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRefreshChatGPTAuthKeepsFreshATWhenSessionBlocked(t *testing.T) {
+	exec := NewExecutor(nil, "")
+	exec.refreshFromSession = func(string) (string, time.Time, error) {
+		return "", time.Time{}, fmt.Errorf("session refresh http=403 body=<html>")
+	}
+	auth := &coreauth.Auth{
+		Metadata: map[string]any{
+			"access_token":  jwtA,
+			"session_token": "st-1",
+		},
+	}
+	got, err := exec.Refresh(context.Background(), auth)
+	if err != nil || got != auth {
+		t.Fatalf("fresh AT should survive session 403, got %#v err=%v", got, err)
 	}
 }
 

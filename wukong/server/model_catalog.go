@@ -3,6 +3,8 @@ package server
 // model_catalog.go —— 启动时及定期从官网拉取模型目录，驱动 model 解析与 /v1/models。
 //
 // 拉取失败不影响服务可用：sentinel 侧会退回静态表，/v1/models 保持内置列表。
+// 失败原因会写进 CatalogStatus，401/403 还会回写到用过的 chatgpt-web 凭证上，
+// 面板卡片才能显示，而不是只有启动日志。
 
 import (
 	"errors"
@@ -10,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	sentinel "github.com/router-for-me/CLIProxyAPI/v7/wukong/sentinel"
 )
@@ -23,14 +27,24 @@ const catalogRefreshInterval = 6 * time.Hour
 // modelsMu 保护 supportedModels——启动后会被刷新协程替换。
 var modelsMu sync.RWMutex
 
+var catalogFlight singleflight.Group
+
+// CatalogTokenPicker 选出一条可用来拉目录的 Access Token。
+// authID 用于 401 时把错误写回那张凭证卡。
+type CatalogTokenPicker func() (token, authID string, ok bool)
+
+// CatalogHooks 目录同步的副作用：成功后重注册模型，鉴权失败则标红凭证。
+type CatalogHooks struct {
+	OnSuccess     func()
+	OnAuthFailure func(authID, message string)
+}
+
 // StartModelCatalogSync 启动时拉取一次模型目录，随后定期刷新。
-// pickToken 为空或暂无可用 AT 时静默跳过，服务继续用静态表。
-func StartModelCatalogSync(cfg *ServerConfig, pickToken func() (string, bool)) {
-	if pickToken == nil {
-		return
-	}
+// 返回的函数可在灌号后立刻再踢一次（与周期刷新共用 singleflight）。
+// pick 为空或暂无可用 AT 时静默跳过，服务继续用静态表。
+func StartModelCatalogSync(cfg *ServerConfig, pick CatalogTokenPicker, hooks CatalogHooks) func() {
 	refresh := func() {
-		if err := syncModelCatalog(cfg, pickToken); err != nil {
+		if err := syncModelCatalog(cfg, pick, hooks); err != nil {
 			log.Printf("[models] 目录同步失败（继续使用静态表）: %v", err)
 		}
 	}
@@ -42,15 +56,30 @@ func StartModelCatalogSync(cfg *ServerConfig, pickToken func() (string, bool)) {
 			refresh()
 		}
 	}()
+	return refresh
+}
+
+// CatalogStatus 返回最近一次官网目录同步结果，给 /chatgpt 与面板模型弹窗用。
+func CatalogStatus() sentinel.CatalogSyncInfo {
+	return sentinel.CurrentCatalogStatus()
 }
 
 // syncModelCatalog 用任一可用 Access Token 拉取目录并安装。
-func syncModelCatalog(cfg *ServerConfig, pickToken func() (string, bool)) error {
-	if pickToken == nil {
+func syncModelCatalog(cfg *ServerConfig, pick CatalogTokenPicker, hooks CatalogHooks) error {
+	_, err, _ := catalogFlight.Do("chatgpt-web", func() (any, error) {
+		return nil, syncModelCatalogOnce(cfg, pick, hooks)
+	})
+	return err
+}
+
+func syncModelCatalogOnce(cfg *ServerConfig, pick CatalogTokenPicker, hooks CatalogHooks) error {
+	if pick == nil {
+		setCatalogFallback(errNoTokenForCatalog)
 		return errNoTokenForCatalog
 	}
-	token, ok := pickToken()
+	token, authID, ok := pick()
 	if !ok {
+		setCatalogFallback(errNoTokenForCatalog)
 		return errNoTokenForCatalog
 	}
 	client := sentinel.NewClient(sentinel.Config{
@@ -59,14 +88,49 @@ func syncModelCatalog(cfg *ServerConfig, pickToken func() (string, bool)) error 
 	})
 	cat, err := client.FetchModelCatalog()
 	if err != nil {
+		setCatalogFallback(err)
+		if isCatalogAuthFailure(err) && hooks.OnAuthFailure != nil && authID != "" {
+			hooks.OnAuthFailure(authID, catalogAuthFailureMessage(err))
+		}
 		return err
 	}
 
 	sentinel.SetModelCatalog(cat)
 	setSupportedModels(buildModelList(cat))
+	setCatalogLive()
+	if hooks.OnSuccess != nil {
+		hooks.OnSuccess()
+	}
 	log.Printf("[models] 已同步官网模型目录：%d 个 slug（%s）",
 		len(cat.Models), strings.Join(firstN(cat.Slugs(), 6), ", "))
 	return nil
+}
+
+func setCatalogLive() {
+	sentinel.SetCatalogStatus(sentinel.CatalogSourceLive, "", time.Now())
+}
+
+func setCatalogFallback(err error) {
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	sentinel.SetCatalogStatus(sentinel.CatalogSourceFallback, msg, time.Time{})
+}
+
+func isCatalogAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "http 401") || strings.Contains(msg, "http 403")
+}
+
+func catalogAuthFailureMessage(err error) string {
+	if err == nil {
+		return "模型目录同步失败：token 无效，请重新灌入 ChatGPT 网页会话"
+	}
+	return "模型目录同步失败（token 无效）：" + err.Error()
 }
 
 // buildModelList 把目录转成 /v1/models 的返回列表。

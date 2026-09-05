@@ -102,6 +102,7 @@ func main() {
 
 	// svc 在 Build 之后才有；运行时增删账号后要用它触发一次模型重注册。
 	var svc *sdkcliproxy.Service
+	var resyncCatalog func()
 
 	grokCfg := grok.ConfigFromEnv()
 	if sentinelCfg.ProxyURL != "" {
@@ -124,6 +125,9 @@ func main() {
 		if svc != nil {
 			svc.RefreshNativeProviderModels(glue.ProviderKey)
 		}
+		if resyncCatalog != nil {
+			resyncCatalog()
+		}
 	})
 	registered, err := chatgptAccounts.Load(ctx, sentinelCfg.ChatGPTFile)
 	if err != nil {
@@ -133,8 +137,15 @@ func main() {
 	if registered == 0 {
 		log.Printf("[startup] 警告：auth-dir 与 %s 里都没有可用凭证，可用 POST /chatgpt/upload 或 /v0/management/auth-files 灌号", sentinelCfg.ChatGPTFile)
 	}
-	// 官网模型目录同步，AT 从 Manager 取。无号时静默用静态表。
-	sentinelserver.StartModelCatalogSync(&sentinelCfg, chatgptAccounts.PickAccessToken)
+	// 官网模型目录同步，AT 从 Manager 取；无号或 401 时用静态表，并回写到凭证卡。
+	resyncCatalog = sentinelserver.StartModelCatalogSync(&sentinelCfg, chatgptAccounts.PrepareCatalogToken, sentinelserver.CatalogHooks{
+		OnSuccess: func() {
+			if svc != nil {
+				svc.RefreshNativeProviderModels(glue.ProviderKey)
+			}
+		},
+		OnAuthFailure: chatgptAccounts.MarkCatalogError,
+	})
 	grokRegistered, err := grokAccounts.Load(ctx, sentinelCfg.GrokFile)
 	if err != nil {
 		log.Fatalf("register grok credentials: %v", err)

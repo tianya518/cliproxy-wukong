@@ -215,18 +215,107 @@ func (s *ChatGPTAccounts) ErrorIDs() []string {
 }
 
 // PickAccessToken returns one usable ChatGPT access token for catalog sync.
+// It does not hit the network.
 func (s *ChatGPTAccounts) PickAccessToken() (string, bool) {
+	token, _, _ := s.pickCatalogAuth()
+	return token, token != ""
+}
+
+// PrepareCatalogToken picks a usable chatgpt-web auth for /backend-api/models.
+// A still-valid access token is used as-is. Session / OAuth refresh only runs
+// when there is no AT. A previous false 403 on the card is cleared if the AT
+// is usable.
+func (s *ChatGPTAccounts) PrepareCatalogToken() (token, authID string, ok bool) {
+	at, auth, ok := s.pickCatalogAuth()
+	if !ok || auth == nil {
+		return "", "", false
+	}
+	if at != "" {
+		s.clearAuthError(context.Background(), auth)
+		return at, auth.ID, true
+	}
+	if !hasRefreshMaterial(auth) {
+		return "", "", false
+	}
+	result, updated := sentinelserver.CheckChatGPTCredential(credentialFromAuth(auth))
+	if !result.Valid {
+		s.markAuthError(context.Background(), auth, result.Error)
+		return "", "", false
+	}
+	if result.Refreshed {
+		applyChatGPTTokens(auth, updated.AccessToken, updated.RefreshToken, updated.SessionToken, updated.ExpiresAt)
+		auth.Status = coreauth.StatusActive
+		auth.StatusMessage = ""
+		_, _ = s.mgr.Update(context.Background(), auth)
+		fresh, err := accessTokenFrom(auth)
+		if err != nil || fresh == "" {
+			return "", "", false
+		}
+		at = fresh
+	}
+	return at, auth.ID, at != ""
+}
+
+func (s *ChatGPTAccounts) pickCatalogAuth() (string, *coreauth.Auth, bool) {
+	var picked *coreauth.Auth
 	var token string
 	s.each(func(auth *coreauth.Auth) {
-		if token != "" || authUnusable(auth) {
+		if picked != nil || auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
 			return
 		}
 		at, err := accessTokenFrom(auth)
 		if err == nil && at != "" {
+			picked = auth
 			token = at
+			return
+		}
+		if authUnusable(auth) {
+			return
+		}
+		if hasRefreshMaterial(auth) {
+			picked = auth
 		}
 	})
-	return token, token != ""
+	if picked == nil {
+		return "", nil, false
+	}
+	return token, picked, true
+}
+
+// MarkCatalogError writes a catalog 401/403 onto the auth that was used so
+// the management card shows a warning instead of looking healthy.
+func (s *ChatGPTAccounts) MarkCatalogError(authID, message string) {
+	if s == nil || s.mgr == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	ctx := context.Background()
+	s.each(func(auth *coreauth.Auth) {
+		if auth.ID != authID && auth.FileName != authID {
+			return
+		}
+		s.markAuthError(ctx, auth, message)
+	})
+}
+
+func (s *ChatGPTAccounts) markAuthError(ctx context.Context, auth *coreauth.Auth, message string) {
+	if auth == nil {
+		return
+	}
+	auth.Status = coreauth.StatusError
+	auth.StatusMessage = strings.TrimSpace(message)
+	if auth.StatusMessage == "" {
+		auth.StatusMessage = "chatgpt session invalid"
+	}
+	_, _ = s.mgr.Update(ctx, auth)
+}
+
+func (s *ChatGPTAccounts) clearAuthError(ctx context.Context, auth *coreauth.Auth) {
+	if auth == nil || (auth.Status != coreauth.StatusError && auth.StatusMessage == "") {
+		return
+	}
+	auth.Status = coreauth.StatusActive
+	auth.StatusMessage = ""
+	_, _ = s.mgr.Update(ctx, auth)
 }
 
 // CheckAll probes each chatgpt-web auth. Successful session/OAuth refreshes
@@ -244,14 +333,13 @@ func (s *ChatGPTAccounts) CheckAll() []sentinelserver.TokenCheckResult {
 		}
 		if result.Valid && result.Refreshed {
 			applyChatGPTTokens(auth, updated.AccessToken, updated.RefreshToken, updated.SessionToken, updated.ExpiresAt)
+		}
+		if result.Valid {
 			auth.Status = coreauth.StatusActive
+			auth.StatusMessage = ""
 			_, _ = s.mgr.Update(ctx, auth)
-		} else if result.Valid && auth.Status == coreauth.StatusError {
-			auth.Status = coreauth.StatusActive
-			_, _ = s.mgr.Update(ctx, auth)
-		} else if !result.Valid {
-			auth.Status = coreauth.StatusError
-			_, _ = s.mgr.Update(ctx, auth)
+		} else {
+			s.markAuthError(ctx, auth, result.Error)
 		}
 		out = append(out, result)
 	})

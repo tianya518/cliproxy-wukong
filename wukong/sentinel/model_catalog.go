@@ -114,10 +114,48 @@ func (c *ModelCatalog) index() {
 //
 // 目录与账号无关，全进程共用一份即可；解析路径只读，拉取协程写。
 
+// CatalogSource 说明当前对外模型列表从哪来。
+type CatalogSource string
+
+const (
+	CatalogSourceLive     CatalogSource = "live"
+	CatalogSourceFallback CatalogSource = "fallback"
+)
+
+// CatalogSyncInfo 是官网模型目录的最近一次同步结果。
+// 拉失败时服务继续用静态表，但面板需要把原因露出来，不能只写日志。
+type CatalogSyncInfo struct {
+	Source   CatalogSource `json:"source"`
+	Error    string        `json:"error,omitempty"`
+	SyncedAt time.Time     `json:"synced_at,omitempty"`
+}
+
 var (
 	catalogMu      sync.RWMutex
 	currentCatalog *ModelCatalog
+	catalogStatus  = CatalogSyncInfo{Source: CatalogSourceFallback}
 )
+
+// SetCatalogStatus records whether /backend-api/models last succeeded.
+func SetCatalogStatus(source CatalogSource, errMsg string, syncedAt time.Time) {
+	catalogMu.Lock()
+	defer catalogMu.Unlock()
+	if source != CatalogSourceLive {
+		source = CatalogSourceFallback
+	}
+	catalogStatus = CatalogSyncInfo{
+		Source:   source,
+		Error:    strings.TrimSpace(errMsg),
+		SyncedAt: syncedAt,
+	}
+}
+
+// CurrentCatalogStatus returns the last catalog sync result.
+func CurrentCatalogStatus() CatalogSyncInfo {
+	catalogMu.RLock()
+	defer catalogMu.RUnlock()
+	return catalogStatus
+}
 
 // SetModelCatalog 安装（或替换）全局模型目录。传 nil 表示回退到静态表。
 func SetModelCatalog(c *ModelCatalog) {

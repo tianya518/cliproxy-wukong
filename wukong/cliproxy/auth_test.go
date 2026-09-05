@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -315,7 +316,43 @@ func TestChatGPTAccountsErrorIDs(t *testing.T) {
 	if total, valid, errored := accounts.Stats(); total != 1 || valid != 0 || errored != 1 {
 		t.Fatalf("stats total=%d valid=%d errored=%d", total, valid, errored)
 	}
-	if _, ok := accounts.PickAccessToken(); ok {
-		t.Fatal("unusable auth should not be picked")
+	if at, ok := accounts.PickAccessToken(); !ok || at != jwtA {
+		t.Fatal("a still-valid AT should stay pickable after a false status error")
+	}
+}
+
+func TestChatGPTAccountsMarkCatalogError(t *testing.T) {
+	mgr := coreauth.NewManager(nil, nil, nil)
+	accounts := NewChatGPTAccounts(mgr, "", nil)
+	if _, err := accounts.Import([]string{jwtA}); err != nil {
+		t.Fatal(err)
+	}
+	auth := mgr.List()[0]
+	accounts.MarkCatalogError(auth.ID, "模型目录同步失败（token 无效）：http 401")
+	got := mgr.List()[0]
+	if got.Status != coreauth.StatusError {
+		t.Fatalf("status = %q", got.Status)
+	}
+	if !strings.Contains(got.StatusMessage, "http 401") {
+		t.Fatalf("status_message = %q", got.StatusMessage)
+	}
+	token, _, ok := accounts.PrepareCatalogToken()
+	if !ok || token != jwtA {
+		t.Fatalf("fresh AT should still be used after catalog error, ok=%t", ok)
+	}
+	if cleared := mgr.List()[0]; cleared.Status != coreauth.StatusActive || cleared.StatusMessage != "" {
+		t.Fatalf("status=%q message=%q", cleared.Status, cleared.StatusMessage)
+	}
+}
+
+func TestPrepareCatalogTokenUsesExistingAT(t *testing.T) {
+	mgr := coreauth.NewManager(nil, nil, nil)
+	accounts := NewChatGPTAccounts(mgr, "", nil)
+	if _, err := accounts.Import([]string{jwtA}); err != nil {
+		t.Fatal(err)
+	}
+	token, id, ok := accounts.PrepareCatalogToken()
+	if !ok || token != jwtA || id == "" {
+		t.Fatalf("token=%q id=%q ok=%t", token, id, ok)
 	}
 }

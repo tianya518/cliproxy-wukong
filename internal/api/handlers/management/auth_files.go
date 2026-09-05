@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/wukong/sentinel"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -175,11 +176,13 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 
 	// Try to find auth ID via authManager
 	var authID string
+	var provider string
 	if h.authManager != nil {
 		auths := h.authManager.List()
 		for _, auth := range auths {
 			if auth.FileName == name || auth.ID == name {
 				authID = auth.ID
+				provider = strings.TrimSpace(auth.Provider)
 				break
 			}
 		}
@@ -210,7 +213,19 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 		result = append(result, entry)
 	}
 
-	c.JSON(200, gin.H{"models": result})
+	payload := gin.H{"models": result}
+	if strings.EqualFold(provider, "chatgpt-web") {
+		st := sentinel.CurrentCatalogStatus()
+		payload["catalog_source"] = string(st.Source)
+		if st.Error != "" {
+			payload["catalog_error"] = st.Error
+		}
+		if !st.SyncedAt.IsZero() {
+			payload["catalog_synced_at"] = st.SyncedAt.UTC().Format(time.RFC3339)
+		}
+	}
+
+	c.JSON(200, payload)
 }
 
 // List auth files from disk when the auth manager is unavailable.

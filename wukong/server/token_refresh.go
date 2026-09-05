@@ -147,6 +147,20 @@ func normalizeSessionToken(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// AccessTokenFresh 判断 access token 是否仍在 JWT exp 之前。
+// 官网 /api/auth/session 给出的 AT 本身就能用，不必先拿 session 去换票。
+func AccessTokenFresh(accessToken string, now time.Time) (time.Time, bool) {
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" || !isAccessToken(accessToken) {
+		return time.Time{}, false
+	}
+	exp := parseJWTExp(accessToken)
+	if exp.IsZero() || !now.Before(exp) {
+		return exp, false
+	}
+	return exp, true
+}
+
 // parseJWTExp 从 JWT payload 解析 exp；失败则默认 +24h。
 func parseJWTExp(token string) time.Time {
 	parts := strings.Split(token, ".")

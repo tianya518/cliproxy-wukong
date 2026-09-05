@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestParseCredentialInput(t *testing.T) {
@@ -135,6 +136,26 @@ func TestCheckChatGPTCredentialEmptyAndExpired(t *testing.T) {
 	r, _ = CheckChatGPTCredential(Credential{AccessToken: expired})
 	if r.Valid || r.Error != "access token expired" {
 		t.Fatalf("expired: %+v", r)
+	}
+}
+
+func TestCheckChatGPTCredentialUsesFreshATWithoutRefresh(t *testing.T) {
+	at := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQxMDI0NDQ4MDB9.x"
+	r, cred := CheckChatGPTCredential(Credential{
+		AccessToken:  at,
+		SessionToken: "st-should-not-be-used",
+	})
+	if !r.Valid || r.Refreshed || r.Error != "" || cred.AccessToken != at {
+		t.Fatalf("fresh AT should be used as-is: %+v cred=%+v", r, cred)
+	}
+}
+
+func TestAccessTokenFresh(t *testing.T) {
+	if _, ok := AccessTokenFresh("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjEwMDAwMDAwMDB9.x", time.Unix(1_700_000_000, 0)); ok {
+		t.Fatal("expired AT should not be fresh")
+	}
+	if exp, ok := AccessTokenFresh("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQxMDI0NDQ4MDB9.x", time.Unix(1_700_000_000, 0)); !ok || exp.Unix() != 4102444800 {
+		t.Fatalf("future AT should be fresh, exp=%v ok=%t", exp, ok)
 	}
 }
 
