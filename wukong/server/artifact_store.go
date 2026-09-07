@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -76,6 +77,10 @@ type ArtifactStore struct {
 	publicPath   string
 	fetchTimeout time.Duration
 
+	// 内联 base64：默认开、单张上限 8 MB。
+	inlineEnabled  bool
+	inlineMaxBytes int64
+
 	fetchMu  sync.RWMutex
 	fetchers map[string]ArtifactFetcher
 	flight   singleflight.Group
@@ -111,13 +116,137 @@ func NewArtifactStore(opts ArtifactStoreOptions) (*ArtifactStore, error) {
 		return nil, err
 	}
 	return &ArtifactStore{
-		index:        index,
-		cache:        cache,
-		publicPath:   publicPath,
-		fetchTimeout: fetchTimeout,
-		fetchers:     make(map[string]ArtifactFetcher),
-		cleanupDone:  make(chan struct{}),
+		index:          index,
+		cache:          cache,
+		publicPath:     publicPath,
+		fetchTimeout:   fetchTimeout,
+		inlineEnabled:  true,
+		inlineMaxBytes: 8 << 20,
+		fetchers:       make(map[string]ArtifactFetcher),
+		cleanupDone:    make(chan struct{}),
 	}, nil
+}
+
+// SetInlineImages 配置生成图是否以 images[] 内联 base64 返回，以及单张上限（<=0 用默认 8 MB）。
+func (s *ArtifactStore) SetInlineImages(enabled bool, maxBytes int64) {
+	if s == nil {
+		return
+	}
+	s.inlineEnabled = enabled
+	if maxBytes > 0 {
+		s.inlineMaxBytes = maxBytes
+	}
+}
+
+// InlineImagesEnabled 报告是否开启内联。
+func (s *ArtifactStore) InlineImagesEnabled() bool { return s != nil && s.inlineEnabled }
+
+// IDFromPublicURL 识别本网关发出的产物链接（…<publicPath>/<id>.<ext>），返回 id；不是则 ok=false。
+// 只看路径，不校验主机名：ARTIFACT_BASE_URL 换过域名后旧链接仍应被认出来。
+func (s *ArtifactStore) IDFromPublicURL(raw string) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
+	p := raw
+	if i := strings.Index(p, "://"); i >= 0 {
+		p = p[i+3:]
+		if j := strings.IndexByte(p, '/'); j >= 0 {
+			p = p[j:]
+		} else {
+			return "", false
+		}
+	}
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		p = p[:i]
+	}
+	prefix := s.publicPath + "/"
+	if !strings.HasPrefix(p, prefix) {
+		return "", false
+	}
+	name := p[len(prefix):]
+	if strings.Contains(name, "/") {
+		return "", false
+	}
+	id, _ := splitArtifactName(name)
+	if id == "" {
+		return "", false
+	}
+	if _, ok := s.index.get(id); !ok {
+		return "", false
+	}
+	return id, true
+}
+
+// ReadBytes 读出产物全部字节（缓存缺失时回源）。maxBytes>0 且超限时返回 ErrArtifactTooLarge。
+func (s *ArtifactStore) ReadBytes(ctx context.Context, id string, maxBytes int64) ([]byte, ArtifactRecord, error) {
+	rec, err := s.Ensure(ctx, id)
+	if err != nil {
+		return nil, rec, err
+	}
+	f, info, err := s.cache.open(id)
+	if err != nil {
+		return nil, rec, fmt.Errorf("%w: %v", ErrArtifactUnavailable, err)
+	}
+	defer f.Close()
+	if maxBytes > 0 && info.Size() > maxBytes {
+		return nil, rec, ErrArtifactTooLarge
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, rec, fmt.Errorf("%w: %v", ErrArtifactUnavailable, err)
+	}
+	return data, rec, nil
+}
+
+// ErrArtifactTooLarge 产物超过调用方给的大小上限。
+var ErrArtifactTooLarge = errors.New("artifact too large")
+
+// InlineImageParts 把一组图片产物读成 images[]（data URL）。关闭内联、非图片、超限或读不到的项
+// 静默跳过——链接仍在 markdown 里，内联只是锦上添花。
+func (s *ArtifactStore) InlineImageParts(ctx context.Context, ids []string) []ImagePart {
+	if s == nil || !s.inlineEnabled || len(ids) == 0 {
+		return nil
+	}
+	out := make([]ImagePart, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		rec, ok := s.index.get(id)
+		if !ok || rec.Kind != ArtifactKindImage {
+			continue
+		}
+		data, rec, err := s.ReadBytes(ctx, id, s.inlineMaxBytes)
+		if err != nil {
+			if !errors.Is(err, ErrArtifactTooLarge) {
+				log.Printf("[artifact] 内联 %s 失败（只给链接）: %v", id, err)
+			}
+			continue
+		}
+		mimeType := artifactMimeFor(rec)
+		if i := strings.IndexByte(mimeType, ';'); i >= 0 {
+			mimeType = strings.TrimSpace(mimeType[:i])
+		}
+		out = append(out, ImagePart{
+			Type:     "image_url",
+			ImageURL: ImageURL{URL: "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)},
+			Index:    len(out),
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // NewArtifactStoreFromConfig 按 ServerConfig 的 ARTIFACT_* 配置构造。
@@ -133,7 +262,7 @@ func NewArtifactStoreFromConfig(cfg *ServerConfig) (*ArtifactStore, error) {
 	if cfg.ArtifactMaxAgeDays > 0 {
 		maxAge = time.Duration(cfg.ArtifactMaxAgeDays) * 24 * time.Hour
 	}
-	return NewArtifactStore(ArtifactStoreOptions{
+	s, err := NewArtifactStore(ArtifactStoreOptions{
 		Dir:           cfg.ArtifactDir,
 		IndexPath:     cfg.ArtifactIndexPath,
 		PublicPath:    cfg.ArtifactPublicPath,
@@ -141,6 +270,15 @@ func NewArtifactStoreFromConfig(cfg *ServerConfig) (*ArtifactStore, error) {
 		MaxAge:        maxAge,
 		FetchTimeout:  time.Duration(cfg.ArtifactFetchTimeoutSec) * time.Second,
 	})
+	if err != nil {
+		return nil, err
+	}
+	var inlineMax int64
+	if cfg.ArtifactInlineMaxMB > 0 {
+		inlineMax = int64(cfg.ArtifactInlineMaxMB) << 20
+	}
+	s.SetInlineImages(cfg.ArtifactInlineImages, inlineMax)
+	return s, nil
 }
 
 // PublicPath 对外路径前缀（如 /files）。

@@ -123,6 +123,37 @@ func (x *GrokExecutor) assetRewriter(authID string, client *grok.Client) func(ct
 	}
 }
 
+// attachInlineImages 把本轮生成图（已改写成 /files 链接）读成 images[] 塞进 OpenAI 载荷的
+// choices[0].<slot>（slot 为 message 或 delta）。没挂存储、关闭内联或读不到时不加字段。
+func (x *GrokExecutor) attachInlineImages(ctx context.Context, payload map[string]any, slot string, urls []string) {
+	if x == nil || x.store == nil || len(urls) == 0 || payload == nil {
+		return
+	}
+	ids := make([]string, 0, len(urls))
+	for _, u := range urls {
+		if id, ok := x.store.IDFromPublicURL(u); ok {
+			ids = append(ids, id)
+		}
+	}
+	parts := x.store.InlineImageParts(ctx, ids)
+	if len(parts) == 0 {
+		return
+	}
+	choices, ok := payload["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		return
+	}
+	choice, ok := choices[0].(map[string]any)
+	if !ok {
+		return
+	}
+	target, ok := choice[slot].(map[string]any)
+	if !ok {
+		return
+	}
+	target["images"] = parts
+}
+
 func (x *GrokExecutor) prefetchAsset(ctx context.Context, client *grok.Client, id, rawURL string, timeout time.Duration) {
 	fctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -165,7 +196,9 @@ func (x *GrokExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req cli
 	if err != nil {
 		return clipexec.Response{}, classify(err)
 	}
-	payload, err := json.Marshal(grok.OpenAICompletion(result))
+	completion := grok.OpenAICompletion(result)
+	x.attachInlineImages(ctx, completion, "message", result.Images)
+	payload, err := json.Marshal(completion)
 	if err != nil {
 		return clipexec.Response{}, err
 	}
@@ -240,7 +273,12 @@ func (x *GrokExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, r
 		if result != nil && result.FinishReason != "" {
 			stop = result.FinishReason
 		}
-		payload, _ := json.Marshal(grok.OpenAIChunk(id, req.Model, "", "", &stop, ""))
+		final := grok.OpenAIChunk(id, req.Model, "", "", &stop, "")
+		if result != nil {
+			// 内联 base64 与 finish_reason 同一个 chunk 给出（与 cliproxy Codex 通道一致）。
+			x.attachInlineImages(ctx, final, "delta", result.Images)
+		}
+		payload, _ := json.Marshal(final)
 		forward(append([]byte("data: "), payload...))
 		forward([]byte("data: [DONE]"))
 	}()

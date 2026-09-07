@@ -58,6 +58,9 @@ type ServerConfig struct {
 	ArtifactMaxAgeDays      int    // 缓存按天清理，默认 0 不限
 	ArtifactFetchTimeoutSec int    // 访问时回源单次超时，默认 60
 	ArtifactVideoTimeoutSec int    // Grok 视频后台预下载超时，默认 120
+	ArtifactInlineImages    bool   // 生成图是否同时以 images[] 内联 base64 返回，默认 true
+	ArtifactInlineMaxMB     int    // 单张内联上限（MB），默认 8；超过只给链接
+	ArtifactHistoryReattach int    // 无 conversation_id 时从历史回挂的图片张数上限，默认 4；0 关闭
 }
 
 // LoadConfig 从环境变量加载配置
@@ -85,6 +88,9 @@ func LoadConfig() ServerConfig {
 		ArtifactMaxAgeDays:      getEnvInt("ARTIFACT_MAX_AGE_DAYS", 0),
 		ArtifactFetchTimeoutSec: getEnvInt("ARTIFACT_FETCH_TIMEOUT_SEC", 60),
 		ArtifactVideoTimeoutSec: getEnvInt("ARTIFACT_VIDEO_TIMEOUT_SEC", 120),
+		ArtifactInlineImages:    getEnvBool("ARTIFACT_INLINE_IMAGES", true),
+		ArtifactInlineMaxMB:     getEnvInt("ARTIFACT_INLINE_MAX_MB", 8),
+		ArtifactHistoryReattach: getEnvInt("ARTIFACT_HISTORY_REATTACH_MAX", 4),
 	}
 }
 

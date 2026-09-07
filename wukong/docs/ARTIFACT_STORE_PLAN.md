@@ -1,6 +1,6 @@
 # 产物存储（ArtifactStore）实施计划
 
-状态：方向已确认（持久映射 + 磁盘缓存）· 2026-09-07
+状态：阶段 1、阶段 2 均已上线并验收通过（2026-09-07，见第 10 节）。
 
 网关把 ChatGPT / Grok 网页通道生成的图片、文件、视频交给标准 OpenAI 客户端（Open WebUI 等）时，
 目前全部依赖"内存会话 + 现拉现转"或"上游直链"。本计划引入服务器侧的产物存储层：**一张持久化的
@@ -352,3 +352,38 @@ docx xlsx pptx zip）。
 - `wukong/README.md` 增加"产物存储"一节与环境变量表。
 - `wukong/cliproxy/config.example.yaml` 注释补充 `ARTIFACT_*` 说明。
 - 重新交叉编译 `cli-proxy-api`（Linux amd64），附 SHA256。
+
+## 10. 实施记录
+
+### 阶段 1（提交 `d2122038`，2026-09-07 线上验收通过）
+
+与计划的差异：
+
+- 回源时**先完整写入缓存再回给客户端**，而不是边流边写。缓存文件因此一定完整，缓存命中路径可支持
+  `Range`；代价是首次回源要等下载完成（图片数秒，视频数十秒）。
+- 沙箱文件与图片的回源都复用 sentinel 已有的 `DownloadFileByFileID` / `DownloadSandboxFile`，没有新增
+  `DownloadFileByID` 方法；Grok 复用已有的 `DownloadAsset`。
+- Grok 钩子挂在 `grok.Client.SetAssetRewriter` 上（按凭证绑定），而不是 `grok.Config` 字段。
+- 映射里没有凭证 ID 的旧记录（升级前由会话代理回填的）回源时会逐个尝试同 provider 的启用凭证；
+  记了凭证 ID 的严格只用那一个。
+
+线上验收（23.142.200.35:8317）：Grok 图匿名 200（原 403）；ChatGPT 4 图流式全部 `/files`、重启后仍 200；
+删缓存文件后回源 200 且带 `X-Artifact-Source: upstream`，二次命中；沙箱 `notes.txt` 200 带
+`Content-Disposition`；Grok 视频 `[Generated Video](…/files/<uuid>.mp4)` 200 `video/mp4`、`Range` 206；
+回归全部通过。
+
+### 阶段 2（2026-09-07 线上验收通过）
+
+线上验收：Open WebUI 风格（无 `conversation_id`、只回传文本历史）"把刚才那只猫换成柯基"→ 新图与原图同背景、
+同构图、同围巾，仅主体替换，证明历史图片确实被重新挂进了本轮；非流式 `message.images[]` 与流式收尾 chunk
+的 `delta.images[]` 均为 data URL，字节数与 `/files` 链接取回一致，纯文本响应无 `images` 字段；Grok 非流式 /
+流式同样带 `images[]`；带 `conversation_id` 续接"再来一张兔子"→ markdown 与 `images[]` 各 1 张、不含旧图；
+回归通过。
+
+- 4.5 `images[]`：`Message.Images` / `Delta.Images`，数据来自缓存（缺失则回源），`ARTIFACT_INLINE_IMAGES`
+  / `ARTIFACT_INLINE_MAX_MB`；Grok 路径在 executor 侧把 `/files` 链接反查回 id 后同样内联。
+- 4.6 历史回挂：`server/history_images.go`。识别历史 assistant 消息里的本网关链接（只看路径，换过域名
+  的旧链接也认）与回传的 `images[]`（data URL）；文本占位 `[图片 N]`，未挂上的旧图占位 `[图片]`；
+  附件引用用 `artifact:<id>` 走存储直读，`uploadAttachments` 也认客户端直接回传的 `/files` 链接。
+- 4.7 续接差集：`sessionEntry.returned`，markdown 与 `images[]` 只含新图，`sentinel` 事件不变；
+  续接轮次没有新图时不再贴任何图片链接。

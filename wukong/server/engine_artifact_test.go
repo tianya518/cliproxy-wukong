@@ -28,7 +28,7 @@ func TestArtifactMarkdownUsesStoreLinksAndRecords(t *testing.T) {
 			{MessageID: "msg-1", SandboxPath: "/mnt/data/report.pdf", FileName: "report.pdf"},
 		},
 	}
-	md := e.artifactMarkdown(env, nil, ChatCompletionRequest{}, result, "conv-1")
+	md := e.artifactMarkdown(env, nil, ChatCompletionRequest{}, result, "conv-1", resultImageFileIDs(result))
 
 	if strings.Contains(md, "/api/image/proxy") || strings.Contains(md, "/api/pdf/proxy") {
 		t.Fatalf("legacy proxy links must not appear when store is set:\n%s", md)
@@ -64,7 +64,7 @@ func TestArtifactMarkdownWithoutStoreKeepsLegacyLinks(t *testing.T) {
 	e := NewEngine(cfg, nil, NewSessionManager(cfg))
 	env := ChatEnv{AbsoluteURL: testAbsolute}
 	result := &sentinel.ChatResult{ExpectGeneratedImages: true, ImageFileIDs: []string{"file_1"}}
-	md := e.artifactMarkdown(env, nil, ChatCompletionRequest{}, result, "conv-1")
+	md := e.artifactMarkdown(env, nil, ChatCompletionRequest{}, result, "conv-1", resultImageFileIDs(result))
 	if !strings.Contains(md, "http://gw.example/api/image/proxy?conv_id=conv-1&file_id=file_1") {
 		t.Fatalf("legacy link expected:\n%s", md)
 	}

@@ -88,6 +88,19 @@ JSON 里加 `"prefix": "chatgpt-web"`（Grok 为 `"grok-web"`）；想换前缀�
 Grok 的文件都只对创建它的账号开放，凭证被删就 502。旧的 `/api/image/proxy`、`/api/pdf/proxy` 变成兼容
 别名：映射命中走同一条链，命中不了才退回会话代理并顺手回填。
 
+面向标准客户端（Open WebUI 等）的三个补充：
+
+- **图片同时内联**：生成图除 markdown 链接外，还放进 `choices[0].message.images[]`
+  （流式在带 `finish_reason` 的 chunk 的 `delta.images`），格式与 cliproxy Codex 通道一致
+  （`{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}`）。认这个字段的客户端会把图
+  存进自己的聊天记录，链接失效也不影响。
+- **历史图片回挂**：不带 `conversation_id` 的请求每轮都是新的官网会话，历史只能展平成文本；此时
+  历史 assistant 消息里本网关的 `/files/<id>` 图片链接（以及客户端回传的 `images[]`）会重新作为
+  附件挂进本轮，文本里换成 `[图片 N]` 占位并附一行说明，模型才真的看得到"刚才那张"。只挂最近
+  `ARTIFACT_HISTORY_REATTACH_MAX` 张。
+- **续接只返本轮新图**：带 `conversation_id` 续接时官网按整个会话的图槽重建列表，网关做差集，
+  markdown 与 `images[]` 只含本轮新增的图；`sentinel` 事件保持完整（含 slot / revision）。
+
 环境变量（都有默认值，不配也能跑）：
 
 | 变量 | 默认 | 说明 |
@@ -99,6 +112,9 @@ Grok 的文件都只对创建它的账号开放，凭证被删就 502。旧的 `
 | `ARTIFACT_MAX_AGE_DAYS` | `0` | 缓存按天清理，`0` 不限 |
 | `ARTIFACT_FETCH_TIMEOUT_SEC` | `60` | 访问时回源单次超时 |
 | `ARTIFACT_VIDEO_TIMEOUT_SEC` | `120` | Grok 视频后台预下载超时（超时不影响链接，访问时再回源） |
+| `ARTIFACT_INLINE_IMAGES` | `true` | 生成图是否内联 `images[]` |
+| `ARTIFACT_INLINE_MAX_MB` | `8` | 单张内联上限，超过只给链接 |
+| `ARTIFACT_HISTORY_REATTACH_MAX` | `4` | 历史回挂张数，`0` 关闭 |
 | `ARTIFACT_BASE_URL` | 网关自身 | 链接前缀，对外部署必须设成末端客户端可达的地址 |
 
 `/files/*` 与旧的产物代理一样免 api-key，靠不可枚举的 ID（官网 `file_id` / 资源 UUID / 哈希）保护。

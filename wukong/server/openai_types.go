@@ -66,6 +66,18 @@ func (r ChatCompletionRequest) resolvedGizmoID() string {
 type Message struct {
 	Role    string      `json:"role"`    // "system" | "user" | "assistant"
 	Content interface{} `json:"content"` // 文本内容 (string) 或 多模态数组 ([]ContentPart)
+	// Images 生成图片的内联 base64（OpenRouter 约定，cliproxy 的 Codex 通道同款）。
+	// 出站：assistant 消息附带本轮生成的图；入站：客户端回传历史时可能原样带回来，
+	// 历史回挂会把它们当作上一轮的图重新挂进本轮。
+	Images []ImagePart `json:"images,omitempty"`
+}
+
+// ImagePart 内联图片项：{"type":"image_url","image_url":{"url":"data:image/png;base64,..."},"index":0}。
+// index 始终输出（含 0），与 cliproxy Codex 翻译器一致。
+type ImagePart struct {
+	Type     string   `json:"type"`
+	ImageURL ImageURL `json:"image_url"`
+	Index    int      `json:"index"`
 }
 
 // ContentPart 多模态内容项
@@ -148,8 +160,9 @@ type ChunkChoice struct {
 
 // Delta 流式增量内容
 type Delta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role    string      `json:"role,omitempty"`
+	Content string      `json:"content,omitempty"`
+	Images  []ImagePart `json:"images,omitempty"` // 与 finish_reason 同一个 chunk 里给出本轮生成图
 }
 
 // ─── 模型列表 ─────────────────────────────────────────────────────────────────

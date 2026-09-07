@@ -104,18 +104,28 @@ func (e *Engine) prepare(env ChatEnv, req *ChatCompletionRequest) (*preparedTurn
 		e.session.Register(req.ConversationID, entry)
 	}
 
-	// 无 conversationID 时上游会话不持有上下文，需把历史轮次与 system prompt 一并展平进本轮输入
+	// 无 conversationID 时上游会话不持有上下文，需把历史轮次与 system prompt 一并展平进本轮输入。
+	// 历史里本网关生成过的图（/files/<id> 链接或客户端回传的 images[]）会重新挂进本轮，
+	// 否则模型只看得到一行它打不开的 URL 文本。
 	inputMsg := userMsg
+	var historyRefs []string
 	if req.ConversationID == "" {
-		if history := flattenHistory(req.Messages); history != "" {
-			inputMsg = "[Conversation so far]\n" + history + "\n\n[Current message]\n" + userMsg
+		history := flattenHistory(req.Messages)
+		var note string
+		history, historyRefs, note = e.reattachHistoryImages(req.Messages, history)
+		if history != "" {
+			inputMsg = "[Conversation so far]\n" + history + "\n\n"
+			if note != "" {
+				inputMsg += note + "\n\n"
+			}
+			inputMsg += "[Current message]\n" + userMsg
 		}
 		if systemPrompt != "" && entry.client.GetModel() != "" {
 			inputMsg = "[System]: " + systemPrompt + "\n\n" + inputMsg
 		}
 	}
 
-	uploadedImages := e.uploadAttachments(env, entry, b64Images)
+	uploadedImages := e.uploadAttachments(env, entry, append(historyRefs, b64Images...))
 
 	resolved := sentinel.ResolveChatModel(req.Model)
 	apiModel := resolved.APIModel
@@ -166,7 +176,37 @@ func (e *Engine) uploadAttachments(env ChatEnv, entry *sessionEntry, refs []stri
 		var fileName, mimeHint string
 		var err error
 
-		if strings.HasPrefix(b64, "http://") || strings.HasPrefix(b64, "https://") {
+		if strings.HasPrefix(b64, artifactRefScheme) {
+			// 本网关产物存储里的图（历史回挂）：直接读缓存 / 回源，不走 HTTP。
+			if e.store == nil {
+				continue
+			}
+			id := strings.TrimPrefix(b64, artifactRefScheme)
+			var rec ArtifactRecord
+			data, rec, err = e.store.ReadBytes(env.ctx(), id, 0)
+			if err != nil || len(data) == 0 {
+				fmt.Printf("[artifact] 历史图片 %s 读取失败，跳过回挂: %v\n", id, err)
+				continue
+			}
+			mimeHint = artifactMimeFor(rec)
+			fileName = rec.Name
+			if fileName == "" {
+				fileName = rec.ID + "." + rec.Ext
+			}
+		} else if e.store != nil && func() bool { _, ok := e.store.IDFromPublicURL(b64); return ok }() {
+			// 客户端把本网关的 /files 链接当 image_url 传回来：同样直接读存储，不绕一圈 HTTP。
+			id, _ := e.store.IDFromPublicURL(b64)
+			var rec ArtifactRecord
+			data, rec, err = e.store.ReadBytes(env.ctx(), id, 0)
+			if err != nil || len(data) == 0 {
+				continue
+			}
+			mimeHint = artifactMimeFor(rec)
+			fileName = rec.Name
+			if fileName == "" {
+				fileName = rec.ID + "." + rec.Ext
+			}
+		} else if strings.HasPrefix(b64, "http://") || strings.HasPrefix(b64, "https://") {
 			// HTTP/HTTPS URL：先下载再上传
 			data, fileName, mimeHint, err = downloadURL(b64)
 			if err != nil || len(data) == 0 {
@@ -342,8 +382,45 @@ func (e *Engine) persistArtifacts(env ChatEnv, entry *sessionEntry, result *sent
 	}
 }
 
+// resultImageFileIDs 本轮结果里的生图 file_id（多图列表优先，退回单图兼容字段）。
+func resultImageFileIDs(result *sentinel.ChatResult) []string {
+	if result == nil || !result.ExpectGeneratedImages {
+		return nil
+	}
+	if len(result.ImageFileIDs) > 0 {
+		return result.ImageFileIDs
+	}
+	if result.ImageFileID != "" {
+		return []string{result.ImageFileID}
+	}
+	return nil
+}
+
+// imagesToReturn 决定这一轮要交给客户端的生图：新会话全给；带 conversation_id 续接时只给本轮
+// 新增的（官网按整个会话的图槽重建列表，不做差集会让旧图每轮重复出现）。
+func (e *Engine) imagesToReturn(entry *sessionEntry, req ChatCompletionRequest, result *sentinel.ChatResult) []string {
+	ids := resultImageFileIDs(result)
+	if req.ConversationID == "" || entry == nil {
+		return ids
+	}
+	return entry.newImageIDs(ids)
+}
+
+// inlineImages 把本轮生图读成 images[]（data URL）。没挂存储或关闭内联时为 nil。
+func (e *Engine) inlineImages(env ChatEnv, fileIDs []string) []ImagePart {
+	if e.store == nil || len(fileIDs) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(fileIDs))
+	for _, fileID := range fileIDs {
+		ids = append(ids, ChatGPTImageArtifactID(fileID))
+	}
+	return e.store.InlineImageParts(env.ctx(), ids)
+}
+
 // artifactMarkdown 把生图与沙箱产物整理成 markdown 链接，供不认 sentinel 扩展字段的标准客户端展示。
-func (e *Engine) artifactMarkdown(env ChatEnv, entry *sessionEntry, req ChatCompletionRequest, result *sentinel.ChatResult, convID string) string {
+// imageFileIDs 由调用方决定（见 imagesToReturn）；沙箱文件与本地图片路径仍从 result 取。
+func (e *Engine) artifactMarkdown(env ChatEnv, entry *sessionEntry, req ChatCompletionRequest, result *sentinel.ChatResult, convID string, imageFileIDs []string) string {
 	if !req.wantArtifactMarkdown() {
 		return ""
 	}
@@ -355,12 +432,14 @@ func (e *Engine) artifactMarkdown(env ChatEnv, entry *sessionEntry, req ChatComp
 
 	if result.ExpectGeneratedImages {
 		switch {
-		case len(result.ImageFileIDs) > 0:
-			for i, fileID := range result.ImageFileIDs {
+		case len(imageFileIDs) > 1:
+			for i, fileID := range imageFileIDs {
 				fmt.Fprintf(&b, "\n\n![Generated Image %d](%s)", i+1, e.imageArtifactURL(env, authID, convID, fileID))
 			}
-		case result.ImageFileID != "":
-			fmt.Fprintf(&b, "\n\n![Generated Image](%s)", e.imageArtifactURL(env, authID, convID, result.ImageFileID))
+		case len(imageFileIDs) == 1:
+			fmt.Fprintf(&b, "\n\n![Generated Image](%s)", e.imageArtifactURL(env, authID, convID, imageFileIDs[0]))
+		case len(resultImageFileIDs(result)) > 0:
+			// 本轮没有新图（续接轮次全是旧图）：不重复贴链接
 		case result.ImagePath != "":
 			p := result.ImagePath
 			if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") {
@@ -443,13 +522,16 @@ func (e *Engine) Complete(env ChatEnv, req ChatCompletionRequest) (*ChatCompleti
 	}
 	turn.entry.client.EmitNewArtifacts(turn.opts.Artifacts, result)
 	e.persistArtifacts(env, turn.entry, result, result.ConversationID)
+	imageIDs := e.imagesToReturn(turn.entry, req, result)
 
 	content := result.Text
 	sentinel.LogContentPreview(func(format string, args ...interface{}) {
 		fmt.Printf("[chat-response] "+format+"\n", args...)
 	}, "client-body", content)
 
-	content += e.artifactMarkdown(env, turn.entry, req, result, result.ConversationID)
+	content += e.artifactMarkdown(env, turn.entry, req, result, result.ConversationID, imageIDs)
+	inline := e.inlineImages(env, imageIDs)
+	turn.entry.markReturned(resultImageFileIDs(result))
 
 	return &ChatCompletionResponse{
 		ID:      turn.chatID,
@@ -458,7 +540,7 @@ func (e *Engine) Complete(env ChatEnv, req ChatCompletionRequest) (*ChatCompleti
 		Model:   turn.apiModel,
 		Choices: []Choice{{
 			Index:            0,
-			Message:          Message{Role: "assistant", Content: content},
+			Message:          Message{Role: "assistant", Content: content, Images: inline},
 			FinishReason:     "stop",
 			ReasoningContent: reasoningText(result),
 		}},
@@ -583,18 +665,23 @@ func (e *Engine) Stream(env ChatEnv, req ChatCompletionRequest, emit func(ChatCo
 	// 兜底：沙箱等未在流中推送的产物
 	turn.entry.client.EmitNewArtifacts(turn.opts.Artifacts, result)
 	e.persistArtifacts(env, turn.entry, result, registeredConvID)
+	imageIDs := e.imagesToReturn(turn.entry, req, result)
 
-	fmt.Printf("[chat-done] model=%s conv=%s expect_img=%v image_ids=%v %s text_len=%d streamed=%d\n",
-		turn.apiModel, result.ConversationID, result.ExpectGeneratedImages, result.ImageFileIDs,
+	fmt.Printf("[chat-done] model=%s conv=%s expect_img=%v image_ids=%v new=%d %s text_len=%d streamed=%d\n",
+		turn.apiModel, result.ConversationID, result.ExpectGeneratedImages, result.ImageFileIDs, len(imageIDs),
 		result.ImageGenDiagSummary(), len(result.Text), streamedToClient.Len())
 
 	// 兼容：可选 markdown 链接（旧客户端）
-	if md := e.artifactMarkdown(env, turn.entry, req, result, registeredConvID); md != "" {
+	if md := e.artifactMarkdown(env, turn.entry, req, result, registeredConvID, imageIDs); md != "" {
 		emit(chunk(Delta{Content: md}, nil))
 	}
 
+	// 内联 base64 与 finish_reason 同一个 chunk 给出（与 cliproxy Codex 通道一致）。
+	inline := e.inlineImages(env, imageIDs)
+	turn.entry.markReturned(resultImageFileIDs(result))
+
 	stopReason := "stop"
-	stop := chunk(Delta{}, &stopReason)
+	stop := chunk(Delta{Images: inline}, &stopReason)
 	stop.ConversationID = registeredConvID
 	emit(stop)
 	return nil

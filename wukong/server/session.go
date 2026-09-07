@@ -14,6 +14,45 @@ type sessionEntry struct {
 	lastUsed time.Time
 	token    string // 该 session 绑定的 ChatGPT token
 	authID   string // 该 token 对应的凭证 ID（auth-dir 文件名），产物映射用；可能为空
+
+	// returned 记录本会话已经返回给客户端的生图 file_id。续接轮次按整个会话的图槽重建列表，
+	// 不做差集的话上一轮的旧图会在每一轮响应里重复出现。
+	returnedMu sync.Mutex
+	returned   map[string]struct{}
+}
+
+// newImageIDs 返回 ids 里尚未返回过的那部分（保持顺序）。
+func (e *sessionEntry) newImageIDs(ids []string) []string {
+	if e == nil || len(ids) == 0 {
+		return ids
+	}
+	e.returnedMu.Lock()
+	defer e.returnedMu.Unlock()
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, seen := e.returned[id]; seen {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+// markReturned 记下已经返回过的生图 file_id。
+func (e *sessionEntry) markReturned(ids []string) {
+	if e == nil || len(ids) == 0 {
+		return
+	}
+	e.returnedMu.Lock()
+	defer e.returnedMu.Unlock()
+	if e.returned == nil {
+		e.returned = make(map[string]struct{}, len(ids))
+	}
+	for _, id := range ids {
+		if id != "" {
+			e.returned[id] = struct{}{}
+		}
+	}
 }
 
 // SessionManager 有状态多轮对话管理器
