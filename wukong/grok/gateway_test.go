@@ -29,16 +29,44 @@ func TestGatewayEndpointAndHeadersMatchBrowserProtocol(t *testing.T) {
 }
 
 func TestGatewaySessionSupportsNewAndExistingConversations(t *testing.T) {
-	fresh := gatewaySession("fast", nil)
+	fresh := gatewaySession("fast", false, nil)
 	freshXGrok := fresh["x_grok"].(map[string]any)
-	if fresh["model"] != "fast" || freshXGrok["is_temporary"] != true || freshXGrok["load_existing"] != nil {
+	if fresh["model"] != "fast" || freshXGrok["is_temporary"] != false || freshXGrok["disable_memory"] != false || freshXGrok["load_existing"] != nil {
 		t.Fatalf("fresh session = %#v", fresh)
 	}
+	temporary := gatewaySession("fast", true, nil)
+	temporaryXGrok := temporary["x_grok"].(map[string]any)
+	if temporaryXGrok["is_temporary"] != true || temporaryXGrok["disable_memory"] != true || temporaryXGrok["load_existing"] != nil {
+		t.Fatalf("temporary session = %#v", temporary)
+	}
 	previous := &TurnState{ConversationID: "conversation-1", ParentID: "response-1"}
-	existing := gatewaySession("expert", previous)
+	existing := gatewaySession("expert", true, previous)
 	existingXGrok := existing["x_grok"].(map[string]any)
 	if existing["model"] != "expert" || existingXGrok["conversation_id"] != "conversation-1" || existingXGrok["load_existing"] != true || existingXGrok["needs_history"] != false {
 		t.Fatalf("existing session = %#v", existing)
+	}
+	if _, ok := existingXGrok["is_temporary"]; ok {
+		t.Fatalf("existing session should not resend is_temporary: %#v", existing)
+	}
+}
+
+func TestConfigFromEnvTempModeDefaultsOffAndHonorsOverrides(t *testing.T) {
+	t.Setenv("GROK_TEMP_MODE", "")
+	t.Setenv("TEMP_MODE", "")
+	if ConfigFromEnv().TempMode {
+		t.Fatal("temp mode should default to off")
+	}
+	t.Setenv("TEMP_MODE", "true")
+	if !ConfigFromEnv().TempMode {
+		t.Fatal("TEMP_MODE=true should enable grok temp mode")
+	}
+	t.Setenv("GROK_TEMP_MODE", "false")
+	if ConfigFromEnv().TempMode {
+		t.Fatal("GROK_TEMP_MODE should take precedence over TEMP_MODE")
+	}
+	t.Setenv("GROK_TEMP_MODE", "not-a-bool")
+	if ConfigFromEnv().TempMode {
+		t.Fatal("invalid GROK_TEMP_MODE should fall back to default off")
 	}
 }
 

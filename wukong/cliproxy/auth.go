@@ -20,6 +20,169 @@ import (
 
 const chatgptWebRefreshLead = 24 * time.Hour
 
+// 网页逆向的模型名默认带 provider 前缀（chatgpt-web/gpt-5-6-thinking、grok-web/grok-chat-auto），
+// 这样在 /v1/models 里能和 codex / xai 等官方 API 模型（gpt-5.5、gpt-image-2、grok-4.6）一眼分开。
+//
+// 用的是 cliproxy 自带的凭证前缀机制：Auth.Prefix 非空时模型注册为 <prefix>/<model>，
+// 请求到达 executor 前由 rewriteModelForAuth 剥掉前缀（sdk/cliproxy/auth/conductor_models.go）。
+// 配合 config 的 force-model-prefix: true，无前缀旧名就不再出现。
+//
+// 前缀只在 wukong 自己创建凭证（/chatgpt/upload、/grok/upload、旧文件一次性迁移）时写入；
+// 启动加载 auth-dir 时以文件里的 prefix 字段为准，不替用户补默认值——cliproxy 的文件同步器
+// 也会读同一个文件，两边必须一致，否则模型表会在有/无前缀之间来回跳。
+const (
+	defaultChatGPTModelPrefix = ProviderKey
+	defaultGrokModelPrefix    = GrokProviderKey
+
+	// modelPrefixKey 是凭证文件里前缀字段名，与 internal/watcher/synthesizer 读取的键一致。
+	modelPrefixKey = "prefix"
+)
+
+// modelPrefixFromMeta 按 cliproxy 文件同步器同样的规则读前缀：去空白与首尾斜杠，内含斜杠视为无效。
+func modelPrefixFromMeta(meta map[string]any) string {
+	raw, _ := meta[modelPrefixKey].(string)
+	return normalizeModelPrefix(raw)
+}
+
+func normalizeModelPrefix(raw string) string {
+	trimmed := strings.Trim(strings.TrimSpace(raw), "/")
+	if trimmed == "" || strings.Contains(trimmed, "/") {
+		return ""
+	}
+	return trimmed
+}
+
+// modelPrefixOf 取凭证当前生效的前缀：优先运行时字段，其次落盘的 metadata。
+func modelPrefixOf(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if p := normalizeModelPrefix(auth.Prefix); p != "" {
+		return p
+	}
+	return modelPrefixFromMeta(auth.Metadata)
+}
+
+// setModelPrefix 同时写 Auth.Prefix（路由/模型注册用）和 Metadata["prefix"]（落盘用）。
+// 两处必须一致：FileTokenStore 只序列化 Metadata，而模型注册只看 Auth.Prefix。空前缀不做改动。
+func setModelPrefix(auth *coreauth.Auth, prefix string) {
+	if auth == nil {
+		return
+	}
+	prefix = normalizeModelPrefix(prefix)
+	if prefix == "" {
+		return
+	}
+	auth.Prefix = prefix
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata[modelPrefixKey] = prefix
+}
+
+// importModelPrefix 决定导入/重导入一个账号时用的前缀：已有凭证保留用户自定义值，否则用默认。
+func importModelPrefix(existing *coreauth.Auth, fallback string) string {
+	if p := modelPrefixOf(existing); p != "" {
+		return p
+	}
+	return fallback
+}
+
+// chatgptManagedMetaKeys 是 wukong 自己维护的 ChatGPT 凭证字段。重灌同一账号时这些键整体以新值为准，
+// 旧值不继承（新凭证没带 session_token 就不该留着旧的过期值）。其余键——note、proxy_url、weight、
+// priority、headers、excluded_models、model_aliases 这些用户在面板里配的——一律保留，
+// 与上游 OAuth 重新登录时 MergeExistingAuthMetadata 的做法一致。
+var chatgptManagedMetaKeys = []string{
+	"type", "access_token", "accessToken", "api_key",
+	"refresh_token", "refreshToken", "session_token", "sessionToken",
+	"expired", "expires_at", "expiresAt",
+}
+
+// grokManagedMetaKeys 同上，Grok 侧由上传/会话探测/Clearance 刷新维护的字段。
+var grokManagedMetaKeys = []string{
+	"type", "sso_token", "token", "name", "user_id", "userId", "email",
+	"cloudflare_cookies", "cf_cookies", "user_agent", "tier",
+}
+
+func isManagedMetaKey(key string, managed []string) bool {
+	for _, k := range managed {
+		if strings.EqualFold(strings.TrimSpace(key), k) {
+			return true
+		}
+	}
+	return false
+}
+
+// carryOverUserSettings 把旧记录里用户配置的部分搬到重建的新记录上：
+//   - Metadata 里非 managed 的键（面板写入的 note / proxy_url / weight / excluded_models …，含 prefix）；
+//   - Attributes 里新记录没设的键（同步器从上述字段派生的别名、排除表等）；
+//   - 由它们派生的运行时字段 Prefix / ProxyURL / Disabled，以及 CreatedAt。
+//
+// Status 不继承：重灌意味着拿到了新凭证，先按可用处理，坏了由后续请求/巡检再标错。
+// Disabled 继承：那是操作者的明确选择，批量重贴一批 token 不应顺手把停用的号开回去。
+func carryOverUserSettings(next, existing *coreauth.Auth, managed []string) {
+	if next == nil || existing == nil {
+		return
+	}
+	if len(existing.Metadata) > 0 {
+		carry := make(map[string]any, len(existing.Metadata))
+		for k, v := range existing.Metadata {
+			if isManagedMetaKey(k, managed) {
+				continue
+			}
+			carry[k] = v
+		}
+		coreauth.MergeExistingAuthMetadata(next, carry)
+	}
+	if len(existing.Attributes) > 0 {
+		if next.Attributes == nil {
+			next.Attributes = make(map[string]string, len(existing.Attributes))
+		}
+		for k, v := range existing.Attributes {
+			// 凭证本体与由它推出的 auth_kind 只认新记录：RT-only 重灌时若把旧的 api_key 带过来，
+			// accessTokenFrom 会捡到过期 AT。
+			if isManagedMetaKey(k, managed) || k == "api_key" || k == coreauth.AttributeAuthKind {
+				continue
+			}
+			if _, set := next.Attributes[k]; !set {
+				next.Attributes[k] = v
+			}
+		}
+	}
+	if next.Prefix == "" {
+		next.Prefix = existing.Prefix
+	}
+	if next.ProxyURL == "" {
+		next.ProxyURL = existing.ProxyURL
+	}
+	if existing.Disabled {
+		next.Disabled = true
+		next.Status = coreauth.StatusDisabled
+	}
+	if !existing.CreatedAt.IsZero() {
+		next.CreatedAt = existing.CreatedAt
+	}
+}
+
+// replaceManagedMetadata 用 fresh 里的 managed 字段覆盖 auth.Metadata，其余键原样保留。
+// 给"就地刷新"的场景用（如 Grok Clearance 更新）：整体替换 Metadata 会把面板配置一并抹掉。
+func replaceManagedMetadata(auth *coreauth.Auth, fresh map[string]any, managed []string) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any, len(fresh))
+	}
+	for k := range auth.Metadata {
+		if isManagedMetaKey(k, managed) {
+			delete(auth.Metadata, k)
+		}
+	}
+	for k, v := range fresh {
+		auth.Metadata[k] = v
+	}
+}
+
 func init() {
 	lead := chatgptWebRefreshLead
 	coreauth.RegisterRefreshLeadProvider(ProviderKey, func() *time.Duration {
@@ -419,20 +582,24 @@ func (s *ChatGPTAccounts) upsert(ctx context.Context, cred sentinelserver.Creden
 	if !persist {
 		registerCtx = coreauth.WithSkipPersist(ctx)
 	}
-	var err error
-	for _, existing := range s.mgr.List() {
-		if existing == nil || existing.ID != auth.ID {
-			continue
+	var existing *coreauth.Auth
+	for _, candidate := range s.mgr.List() {
+		if candidate != nil && candidate.ID == auth.ID {
+			existing = candidate
+			break
 		}
-		auth.CreatedAt = existing.CreatedAt
-		_, err = s.mgr.Update(registerCtx, auth)
-		if err != nil {
+	}
+	// 重灌已有账号只更新凭证本身：面板里配的 note / proxy_url / 停用状态等都要留下。
+	carryOverUserSettings(auth, existing, chatgptManagedMetaKeys)
+	// 新灌的号默认带 chatgpt-web/ 前缀；重灌已有账号时沿用它现有的前缀（用户可能在面板里改过）。
+	setModelPrefix(auth, importModelPrefix(existing, defaultChatGPTModelPrefix))
+	if existing != nil {
+		if _, err := s.mgr.Update(registerCtx, auth); err != nil {
 			return err
 		}
 		return s.ensurePersisted(auth, persist)
 	}
-	_, err = s.mgr.Register(registerCtx, auth)
-	if err != nil {
+	if _, err := s.mgr.Register(registerCtx, auth); err != nil {
 		return err
 	}
 	return s.ensurePersisted(auth, persist)
@@ -477,7 +644,11 @@ func (s *ChatGPTAccounts) registerAuthDir(ctx context.Context) (int, error) {
 		if errRead != nil {
 			continue
 		}
-		cred, ok := credentialFromAuthFile(data)
+		meta, ok := chatgptAuthFileMeta(data)
+		if !ok {
+			continue
+		}
+		cred, ok := credentialFromMeta(meta)
 		if !ok {
 			continue
 		}
@@ -486,6 +657,8 @@ func (s *ChatGPTAccounts) registerAuthDir(ctx context.Context) (int, error) {
 		}
 		auth := newChatGPTAuth(cred.ID, cred, now)
 		bindChatGPTAuthPath(auth, s.authDir, name)
+		// 以文件为准：有 prefix 就带上，老文件没有就不补（见 defaultChatGPTModelPrefix 处的说明）。
+		setModelPrefix(auth, modelPrefixFromMeta(meta))
 		if _, err = s.mgr.Register(coreauth.WithSkipPersist(ctx), auth); err != nil {
 			return n, fmt.Errorf("register auth %s: %w", auth.ID, err)
 		}
@@ -586,13 +759,26 @@ func bindChatGPTAuthPath(auth *coreauth.Auth, authDir, fileName string) {
 }
 
 func credentialFromAuthFile(data []byte) (sentinelserver.Credential, bool) {
+	meta, ok := chatgptAuthFileMeta(data)
+	if !ok {
+		return sentinelserver.Credential{}, false
+	}
+	return credentialFromMeta(meta)
+}
+
+// chatgptAuthFileMeta 解析 auth-dir 文件，只接受 type=chatgpt-web 的。
+func chatgptAuthFileMeta(data []byte) (map[string]any, bool) {
 	var meta map[string]any
 	if json.Unmarshal(data, &meta) != nil {
-		return sentinelserver.Credential{}, false
+		return nil, false
 	}
 	if t, _ := meta["type"].(string); !strings.EqualFold(strings.TrimSpace(t), ProviderKey) {
-		return sentinelserver.Credential{}, false
+		return nil, false
 	}
+	return meta, true
+}
+
+func credentialFromMeta(meta map[string]any) (sentinelserver.Credential, bool) {
 	cred := sentinelserver.Credential{
 		AccessToken:  strings.TrimSpace(metaString(meta, "access_token", "accessToken")),
 		RefreshToken: strings.TrimSpace(metaString(meta, "refresh_token", "refreshToken")),

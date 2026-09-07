@@ -11,6 +11,8 @@ import (
 
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+
+	sentinelserver "github.com/router-for-me/CLIProxyAPI/v7/wukong/server"
 )
 
 func TestRegisterAuthsFromChatGPTFile(t *testing.T) {
@@ -342,6 +344,227 @@ func TestChatGPTAccountsMarkCatalogError(t *testing.T) {
 	}
 	if cleared := mgr.List()[0]; cleared.Status != coreauth.StatusActive || cleared.StatusMessage != "" {
 		t.Fatalf("status=%q message=%q", cleared.Status, cleared.StatusMessage)
+	}
+}
+
+// 新灌的号要默认带 chatgpt-web 前缀：运行时字段与落盘字段都得有，模型才会以
+// chatgpt-web/<model> 注册并且重启后仍然如此。
+func TestChatGPTAccountsImportSetsDefaultPrefix(t *testing.T) {
+	dir := t.TempDir()
+	authDir := filepath.Join(dir, "auths")
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := sdkAuth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	mgr := coreauth.NewManager(store, nil, nil)
+	accounts := NewChatGPTAccounts(mgr, authDir, nil)
+	if _, err := accounts.Import([]string{jwtA}); err != nil {
+		t.Fatal(err)
+	}
+	auth := mgr.List()[0]
+	if auth.Prefix != ProviderKey {
+		t.Fatalf("Prefix = %q, want %q", auth.Prefix, ProviderKey)
+	}
+	raw, err := os.ReadFile(auth.Attributes[coreauth.AttributePath])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta map[string]any
+	if err = json.Unmarshal(raw, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta[modelPrefixKey] != ProviderKey {
+		t.Fatalf("persisted prefix = %v, want %q; meta=%#v", meta[modelPrefixKey], ProviderKey, meta)
+	}
+}
+
+// 重灌同一个账号不能覆盖用户在面板里改过的前缀。
+func TestChatGPTAccountsReimportKeepsCustomPrefix(t *testing.T) {
+	mgr := coreauth.NewManager(nil, nil, nil)
+	accounts := NewChatGPTAccounts(mgr, "", nil)
+	if _, err := accounts.Import([]string{jwtA}); err != nil {
+		t.Fatal(err)
+	}
+	auth := mgr.List()[0]
+	setModelPrefix(auth, "team-a")
+	if _, err := mgr.Update(coreauth.WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accounts.Import([]string{jwtA}); err != nil {
+		t.Fatal(err)
+	}
+	got := mgr.List()[0]
+	if got.Prefix != "team-a" || got.Metadata[modelPrefixKey] != "team-a" {
+		t.Fatalf("prefix after reimport = %q / %v, want team-a", got.Prefix, got.Metadata[modelPrefixKey])
+	}
+}
+
+// 启动加载 auth-dir 时以文件为准：写了 prefix 的带上，老文件没写的不替用户补默认值。
+func TestRegisterAuthDirHonorsFilePrefix(t *testing.T) {
+	dir := t.TempDir()
+	authDir := filepath.Join(dir, "auths")
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string, meta map[string]any) {
+		raw, err := json.Marshal(meta)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(filepath.Join(authDir, name), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(chatgptWebAuthFileName("with-prefix"), map[string]any{
+		"type": ProviderKey, "access_token": jwtA, modelPrefixKey: " /web/ ",
+	})
+	write(chatgptWebAuthFileName("legacy"), map[string]any{
+		"type": ProviderKey, "access_token": jwtB,
+	})
+
+	mgr := coreauth.NewManager(nil, nil, nil)
+	accounts := NewChatGPTAccounts(mgr, authDir, nil)
+	if n, err := accounts.Load(context.Background(), filepath.Join(dir, "missing.json")); err != nil || n != 2 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	prefixes := map[string]string{}
+	for _, auth := range mgr.List() {
+		prefixes[auth.FileName] = auth.Prefix
+	}
+	if got := prefixes[chatgptWebAuthFileName("with-prefix")]; got != "web" {
+		t.Fatalf("prefix from file = %q, want web (trimmed)", got)
+	}
+	if got := prefixes[chatgptWebAuthFileName("legacy")]; got != "" {
+		t.Fatalf("legacy file without prefix must stay unprefixed, got %q", got)
+	}
+}
+
+// 重灌同一账号只更新凭证：面板里配的 note / proxy_url / weight / 停用状态等必须留在文件里，
+// 而旧的 session_token 这类凭证字段不能从旧记录里继承回来。
+func TestChatGPTAccountsReimportKeepsUserSettings(t *testing.T) {
+	dir := t.TempDir()
+	authDir := filepath.Join(dir, "auths")
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := sdkAuth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	mgr := coreauth.NewManager(store, nil, nil)
+	accounts := NewChatGPTAccounts(mgr, authDir, nil)
+
+	// 上传解析不认 id 字段（ID 由 token 哈希得出），这里直接走 upsert 以固定账号 ID，
+	// 与旧 chatgpt.json 迁移路径一致。
+	ctx := context.Background()
+	if err := accounts.upsert(ctx, sentinelserver.Credential{ID: "acct-1", AccessToken: jwtA, SessionToken: "st-old"}, true); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟用户在面板里改过这张卡
+	auth := mgr.List()[0]
+	auth.Metadata["note"] = "老板的号"
+	auth.Metadata["proxy_url"] = "http://127.0.0.1:7890"
+	auth.Metadata["weight"] = float64(3)
+	auth.Metadata["excluded_models"] = []any{"gpt-5-6-mini"}
+	auth.ProxyURL = "http://127.0.0.1:7890"
+	auth.Disabled = true
+	auth.Status = coreauth.StatusDisabled
+	auth.Attributes["model_aliases"] = `[{"name":"gpt-5-6","alias":"g56"}]`
+	if _, err := mgr.Update(ctx, auth); err != nil {
+		t.Fatal(err)
+	}
+	created := auth.CreatedAt
+
+	if err := accounts.upsert(ctx, sentinelserver.Credential{ID: "acct-1", AccessToken: jwtB, RefreshToken: "rt-new"}, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(mgr.List()); got != 1 {
+		t.Fatalf("manager auths = %d, want 1", got)
+	}
+	got := mgr.List()[0]
+	if got.Metadata["access_token"] != jwtB || got.Metadata["refresh_token"] != "rt-new" {
+		t.Fatalf("credential not updated: %#v", got.Metadata)
+	}
+	if _, stale := got.Metadata["session_token"]; stale {
+		t.Fatalf("stale session_token must not be inherited: %#v", got.Metadata)
+	}
+	if got.Metadata["note"] != "老板的号" || got.Metadata["proxy_url"] != "http://127.0.0.1:7890" || got.Metadata["weight"] != float64(3) {
+		t.Fatalf("user metadata lost: %#v", got.Metadata)
+	}
+	if got.ProxyURL != "http://127.0.0.1:7890" {
+		t.Fatalf("ProxyURL = %q", got.ProxyURL)
+	}
+	if !got.Disabled || got.Status != coreauth.StatusDisabled {
+		t.Fatalf("operator disable must survive reimport: disabled=%v status=%q", got.Disabled, got.Status)
+	}
+	if got.Attributes["model_aliases"] == "" {
+		t.Fatalf("derived attributes lost: %#v", got.Attributes)
+	}
+	if !got.CreatedAt.Equal(created) {
+		t.Fatalf("CreatedAt changed: %v -> %v", created, got.CreatedAt)
+	}
+	if got.Prefix != ProviderKey {
+		t.Fatalf("prefix = %q", got.Prefix)
+	}
+
+	raw, err := os.ReadFile(got.Attributes[coreauth.AttributePath])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta map[string]any
+	if err = json.Unmarshal(raw, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta["note"] != "老板的号" || meta["proxy_url"] != "http://127.0.0.1:7890" || meta["disabled"] != true {
+		t.Fatalf("persisted %#v", meta)
+	}
+	if meta["access_token"] != jwtB {
+		t.Fatalf("persisted access_token = %v", meta["access_token"])
+	}
+}
+
+// RT-only 重灌不能从旧记录的 Attributes 里捡回过期的 access token。
+func TestChatGPTAccountsReimportDoesNotInheritStaleAccessToken(t *testing.T) {
+	mgr := coreauth.NewManager(nil, nil, nil)
+	accounts := NewChatGPTAccounts(mgr, "", nil)
+	ctx := context.Background()
+	if err := accounts.upsert(ctx, sentinelserver.Credential{ID: "acct-1", AccessToken: jwtA}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.upsert(ctx, sentinelserver.Credential{ID: "acct-1", RefreshToken: "rt-only"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(mgr.List()); got != 1 {
+		t.Fatalf("manager auths = %d, want 1", got)
+	}
+	got := mgr.List()[0]
+	if _, err := accessTokenFrom(got); err == nil {
+		t.Fatalf("RT-only reimport must not expose the old AT: meta=%#v attrs=%#v", got.Metadata, got.Attributes)
+	}
+	if got.Attributes[coreauth.AttributeAuthKind] != coreauth.AuthKindOAuth {
+		t.Fatalf("auth_kind = %q", got.Attributes[coreauth.AttributeAuthKind])
+	}
+}
+
+func TestNormalizeModelPrefix(t *testing.T) {
+	cases := map[string]string{
+		"chatgpt-web":   "chatgpt-web",
+		" /grok-web/ ":  "grok-web",
+		"":              "",
+		"   ":           "",
+		"team/a":        "", // 含斜杠与 cliproxy 同步器一样视为无效
+		"/":             "",
+		"chatgpt-web//": "chatgpt-web",
+	}
+	for in, want := range cases {
+		if got := normalizeModelPrefix(in); got != want {
+			t.Errorf("normalizeModelPrefix(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := modelPrefixOf(&coreauth.Auth{Metadata: map[string]any{modelPrefixKey: "from-meta"}}); got != "from-meta" {
+		t.Errorf("modelPrefixOf should fall back to metadata, got %q", got)
+	}
+	if got := modelPrefixOf(&coreauth.Auth{Prefix: "runtime", Metadata: map[string]any{modelPrefixKey: "from-meta"}}); got != "runtime" {
+		t.Errorf("modelPrefixOf should prefer Auth.Prefix, got %q", got)
 	}
 }
 

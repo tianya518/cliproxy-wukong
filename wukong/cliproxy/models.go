@@ -8,6 +8,11 @@ package cliproxy
 // 内置 provider 走同一条重载路径：executor 绑定与模型注册在 config/auths 热重载中
 // 天然存活，不再需要旧版那个每 2 秒“抢回”的自愈循环。运行时官网目录变化则由
 // Service.RefreshNativeProviderModels 主动推送（见 cmd/wukong-gateway 的接线）。
+//
+// 这里给出的都是裸模型名（gpt-5-6-thinking、dall-e-3、grok-chat-auto）。对外列表里的
+// chatgpt-web/ 与 grok-web/ 前缀不在此处拼接，而是 cliproxy 按凭证的 Auth.Prefix 套上的
+// （见 auth.go 的 defaultChatGPTModelPrefix 说明），这样同一份目录既能按前缀路由，
+// 也不用在 executor 里再剥前缀。
 
 import (
 	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"

@@ -271,19 +271,24 @@ func (s *GrokAccounts) upsert(ctx context.Context, cred grok.Credential, persist
 	if !persist {
 		registerCtx = coreauth.WithSkipPersist(ctx)
 	}
-	for _, existing := range s.mgr.List() {
-		if existing == nil || existing.ID != auth.ID {
-			continue
+	var existing *coreauth.Auth
+	for _, candidate := range s.mgr.List() {
+		if candidate != nil && candidate.ID == auth.ID {
+			existing = candidate
+			break
 		}
-		auth.CreatedAt = existing.CreatedAt
-		_, err := s.mgr.Update(registerCtx, auth)
-		if err != nil {
+	}
+	// 重灌已有账号只更新凭证本身，面板配置保留。
+	carryOverUserSettings(auth, existing, grokManagedMetaKeys)
+	// 新灌的号默认带 grok-web/ 前缀；重灌已有账号时沿用它现有的前缀。
+	setModelPrefix(auth, importModelPrefix(existing, defaultGrokModelPrefix))
+	if existing != nil {
+		if _, err := s.mgr.Update(registerCtx, auth); err != nil {
 			return err
 		}
 		return s.ensurePersisted(auth, persist)
 	}
-	_, err := s.mgr.Register(registerCtx, auth)
-	if err != nil {
+	if _, err := s.mgr.Register(registerCtx, auth); err != nil {
 		return err
 	}
 	return s.ensurePersisted(auth, persist)
@@ -325,12 +330,18 @@ func (s *GrokAccounts) registerAuthDir(ctx context.Context) (int, error) {
 		if errRead != nil {
 			continue
 		}
-		cred, ok := grokCredentialFromAuthFile(data)
+		meta, ok := grokAuthFileMeta(data)
+		if !ok {
+			continue
+		}
+		cred, ok := grokCredentialFromMeta(meta)
 		if !ok {
 			continue
 		}
 		auth := newGrokAuth(cred, now)
 		bindGrokAuthPath(auth, s.authDir, name)
+		// 以文件为准：有 prefix 就带上，老文件没有就不补。
+		setModelPrefix(auth, modelPrefixFromMeta(meta))
 		if _, err = s.mgr.Register(coreauth.WithSkipPersist(ctx), auth); err != nil {
 			return n, fmt.Errorf("register auth %s: %w", auth.ID, err)
 		}
@@ -396,14 +407,18 @@ func applyGrokCredential(auth *coreauth.Auth, cred grok.Credential) {
 	if auth == nil {
 		return
 	}
+	// 只覆盖 Grok 自己维护的字段；prefix、note、proxy_url 等面板配置留在 Metadata 里，
+	// 否则 Clearance 刷新落盘一次就全丢了。
 	next := newGrokAuth(cred, time.Now().UTC())
-	auth.Metadata = next.Metadata
+	replaceManagedMetadata(auth, next.Metadata, grokManagedMetaKeys)
 	if auth.Attributes == nil {
 		auth.Attributes = make(map[string]string)
 	}
 	for k, v := range next.Attributes {
 		auth.Attributes[k] = v
 	}
+	// Prefix 字段与 metadata.prefix 可能只有一边有值（老进程注册的记录），这里对齐一下。
+	setModelPrefix(auth, modelPrefixOf(auth))
 	auth.UpdatedAt = next.UpdatedAt
 	auth.Status = coreauth.StatusActive
 }
@@ -442,13 +457,26 @@ func bindGrokAuthPath(auth *coreauth.Auth, authDir, fileName string) {
 }
 
 func grokCredentialFromAuthFile(data []byte) (grok.Credential, bool) {
+	meta, ok := grokAuthFileMeta(data)
+	if !ok {
+		return grok.Credential{}, false
+	}
+	return grokCredentialFromMeta(meta)
+}
+
+// grokAuthFileMeta 解析 auth-dir 文件，只接受 type=grok-web 的。
+func grokAuthFileMeta(data []byte) (map[string]any, bool) {
 	var meta map[string]any
 	if json.Unmarshal(data, &meta) != nil {
-		return grok.Credential{}, false
+		return nil, false
 	}
 	if t, _ := meta["type"].(string); !strings.EqualFold(strings.TrimSpace(t), GrokProviderKey) {
-		return grok.Credential{}, false
+		return nil, false
 	}
+	return meta, true
+}
+
+func grokCredentialFromMeta(meta map[string]any) (grok.Credential, bool) {
 	cred := grok.Credential{
 		Name:              strings.TrimSpace(metaString(meta, "name")),
 		SSOToken:          strings.TrimSpace(metaString(meta, "sso_token", "token")),

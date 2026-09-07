@@ -57,10 +57,13 @@ const (
 )
 
 type Config struct {
-	BaseURL            string
-	ProxyURL           string
-	UserAgent          string
-	AllowNSFW          bool
+	BaseURL   string
+	ProxyURL  string
+	UserAgent string
+	AllowNSFW bool
+	// TempMode 让新建的 Grok 会话走临时模式（is_temporary + disable_memory：
+	// 不进官网历史、不读写账号记忆）。默认 false，即普通会话。
+	TempMode           bool
 	StatsigMode        string
 	StatsigManualValue string
 	StatsigSignerURL   string

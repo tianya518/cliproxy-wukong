@@ -14,10 +14,13 @@ import (
 	"time"
 )
 
+// 网页逆向的凭证默认带 chatgpt-web/ 前缀（见 cliproxy/auth.go），网关开着 force-model-prefix
+// 时裸名不可用，所以这里默认也走带前缀的名字；老部署可用 GW_MODEL / GW_IMAGE_MODEL 覆盖。
 var (
-	base  = env("GW", "http://127.0.0.1:8317")
-	key   = env("GW_KEY", "sk-local-test")
-	model = env("GW_MODEL", "gpt-5-6-instant")
+	base       = env("GW", "http://127.0.0.1:8317")
+	key        = env("GW_KEY", "sk-local-test")
+	model      = env("GW_MODEL", "chatgpt-web/gpt-5-6-instant")
+	imageModel = env("GW_IMAGE_MODEL", "chatgpt-web/dall-e-3")
 )
 
 func env(k, def string) string {
@@ -336,7 +339,7 @@ func geminiStream() {
 // imageGen confirms generated images surface as reachable markdown links.
 func imageGen() {
 	resp, err := do(http.MethodPost, "/v1/chat/completions", map[string]any{
-		"model":    "dall-e-3",
+		"model":    imageModel,
 		"messages": []map[string]string{{"role": "user", "content": "A single blue square on white."}},
 	}, bearer())
 	if err != nil {

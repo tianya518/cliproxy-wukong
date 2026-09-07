@@ -77,7 +77,10 @@ func gatewayHeaders(origin, userID, token, cfCookies, userAgent string) http.Hea
 	return headers
 }
 
-func gatewaySession(model string, previous *TurnState) map[string]any {
+// gatewaySession 组装 session.create 的 session 字段。
+// 新会话按 temporary 决定是否走临时模式：临时会话不进官网历史、不读写账号记忆；
+// 普通会话（默认）与官网直接开新聊天一致。续接已有会话时该标志由上游会话自身决定。
+func gatewaySession(model string, temporary bool, previous *TurnState) map[string]any {
 	xGrok := map[string]any{
 		"protocol_capabilities":   []string{"conversation_attached", "custom_methods_v1"},
 		"use_chunk":               true,
@@ -91,8 +94,8 @@ func gatewaySession(model string, previous *TurnState) map[string]any {
 	}
 	if previous == nil || previous.ConversationID == "" {
 		xGrok["keep_context"] = false
-		xGrok["is_temporary"] = true
-		xGrok["disable_memory"] = true
+		xGrok["is_temporary"] = temporary
+		xGrok["disable_memory"] = temporary
 	} else {
 		xGrok["conversation_id"] = previous.ConversationID
 		xGrok["load_existing"] = true
@@ -159,7 +162,7 @@ func (c *Client) openGatewayStream(ctx context.Context, spec ModelSpec, prompt s
 		_ = connection.Close()
 	}()
 	go func() {
-		streamErr := runGatewayStream(requestCtx, connection, writer, spec.Mode, prompt, attachments, previous)
+		streamErr := runGatewayStream(requestCtx, connection, writer, spec.Mode, c.cfg.TempMode, prompt, attachments, previous)
 		cancel()
 		_ = connection.Close()
 		_ = writer.CloseWithError(streamErr)
@@ -167,7 +170,7 @@ func (c *Client) openGatewayStream(ctx context.Context, spec ModelSpec, prompt s
 	return reader, nil
 }
 
-func runGatewayStream(ctx context.Context, connection *websocket.Conn, writer io.Writer, model, prompt string, attachments []string, previous *TurnState) error {
+func runGatewayStream(ctx context.Context, connection *websocket.Conn, writer io.Writer, model string, temporary bool, prompt string, attachments []string, previous *TurnState) error {
 	connection.SetReadLimit(gatewayMaxFrameBytes)
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = connection.SetReadDeadline(deadline)
@@ -177,7 +180,7 @@ func runGatewayStream(ctx context.Context, connection *websocket.Conn, writer io
 	initial := map[string]any{
 		"event": map[string]any{
 			"type": "session.create", "event_id": initialEventID,
-			"session": gatewaySession(model, previous),
+			"session": gatewaySession(model, temporary, previous),
 		},
 	}
 	currentSessionID := ""
