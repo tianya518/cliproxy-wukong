@@ -13,6 +13,7 @@ type sessionEntry struct {
 	client   *sentinel.Client
 	lastUsed time.Time
 	token    string // 该 session 绑定的 ChatGPT token
+	authID   string // 该 token 对应的凭证 ID（auth-dir 文件名），产物映射用；可能为空
 }
 
 // SessionManager 有状态多轮对话管理器

@@ -15,7 +15,9 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"path"
 	"strings"
+	"sync"
 	"time"
 
 	sentinel "github.com/router-for-me/CLIProxyAPI/v7/wukong/sentinel"
@@ -32,6 +34,9 @@ type ChatEnv struct {
 	Token string
 	// FromPool 标记凭证来自内置池——只有这种情况下鉴权失败才值得换票重试。
 	FromPool bool
+	// AuthID 本轮凭证在 cliproxy 凭证池里的 ID（auth-dir 文件名）。产物映射记录它，
+	// 缓存缺失时据此找回当前有效凭证回源。可为空（无池形态）。
+	AuthID string
 	// AbsoluteURL 把 /api/image/proxy 这类相对路径拼成末端客户端可达的绝对地址。
 	// 为空时产物链接保持相对路径。
 	AbsoluteURL func(path string) string
@@ -56,11 +61,19 @@ type Engine struct {
 	cfg     *ServerConfig
 	pool    *TokenPool
 	session *SessionManager
+	store   *ArtifactStore // 可为空：没有产物存储时链接退回 /api/*/proxy 会话代理
 }
 
 // NewEngine 创建对话内核。
 func NewEngine(cfg *ServerConfig, pool *TokenPool, session *SessionManager) *Engine {
 	return &Engine{cfg: cfg, pool: pool, session: session}
+}
+
+// SetArtifactStore 挂上产物存储：生图 / 沙箱文件先登记映射再落缓存，链接改为 /files/<id>。
+func (e *Engine) SetArtifactStore(store *ArtifactStore) {
+	if e != nil {
+		e.store = store
+	}
 }
 
 // preparedTurn 一轮对话在真正发起前解析好的全部参数。
@@ -84,6 +97,9 @@ func (e *Engine) prepare(env ChatEnv, req *ChatCompletionRequest) (*preparedTurn
 	}
 
 	entry := e.session.GetOrCreate(req.ConversationID, env.Token)
+	if env.AuthID != "" {
+		entry.authID = env.AuthID
+	}
 	if req.ConversationID != "" {
 		e.session.Register(req.ConversationID, entry)
 	}
@@ -187,8 +203,58 @@ func (e *Engine) uploadAttachments(env ChatEnv, entry *sessionEntry, refs []stri
 	return out
 }
 
-// buildArtifactConfig 组装产物流式配置（生图/沙箱文件的代理 URL 构造与事件回调）。
+// imageArtifactURL 生图链接。挂了产物存储时先登记映射再给 /files/<id>.png；否则退回会话代理链接。
+func (e *Engine) imageArtifactURL(env ChatEnv, authID, convID, fileID string) string {
+	if e.store != nil && strings.TrimSpace(fileID) != "" {
+		rec := ArtifactRecord{
+			ID: ChatGPTImageArtifactID(fileID), Ext: "png", Mime: "image/png", Kind: ArtifactKindImage,
+			Provider: chatGPTArtifactProvider, AuthID: authID,
+			Locator: ArtifactLocator{ConvID: convID, FileID: fileID},
+		}
+		if err := e.store.Record(rec); err == nil {
+			if stored, ok := e.store.Lookup(rec.ID); ok {
+				rec = stored
+			}
+			return e.store.PublicURL(env.absolute, rec)
+		} else {
+			fmt.Printf("[artifact] 登记生图映射失败，退回会话代理链接: %v\n", err)
+		}
+	}
+	return env.absolute(fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", convID, fileID))
+}
+
+// sandboxArtifactURL 沙箱文件链接，规则同 imageArtifactURL。
+func (e *Engine) sandboxArtifactURL(env ChatEnv, authID, convID, messageID, sandboxPath string) string {
+	if e.store != nil && strings.TrimSpace(sandboxPath) != "" {
+		name := path.Base(sandboxPath)
+		ext := ArtifactExtForName(name)
+		if ext == "" {
+			ext = "bin"
+		}
+		rec := ArtifactRecord{
+			ID: SandboxArtifactID(convID, messageID, sandboxPath), Ext: ext, Name: name, Kind: ArtifactKindFile,
+			Provider: chatGPTArtifactProvider, AuthID: authID,
+			Locator: ArtifactLocator{ConvID: convID, MessageID: messageID, SandboxPath: sandboxPath},
+		}
+		if err := e.store.Record(rec); err == nil {
+			if stored, ok := e.store.Lookup(rec.ID); ok {
+				rec = stored
+			}
+			return e.store.PublicURL(env.absolute, rec)
+		} else {
+			fmt.Printf("[artifact] 登记沙箱文件映射失败，退回会话代理链接: %v\n", err)
+		}
+	}
+	return env.absolute(fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
+		convID, messageID, url.QueryEscape(sandboxPath)))
+}
+
+// buildArtifactConfig 组装产物流式配置（生图/沙箱文件的链接构造与事件回调）。
 func (e *Engine) buildArtifactConfig(env ChatEnv, entry *sessionEntry, req ChatCompletionRequest, convID string, onEvent func(sentinel.StreamEvent)) sentinel.ArtifactStreamConfig {
+	authID := env.AuthID
+	if authID == "" && entry != nil {
+		authID = entry.authID
+	}
 	return sentinel.ArtifactStreamConfig{
 		Delivery:       req.ArtifactDelivery,
 		ChunkSize:      req.ArtifactBase64ChunkSize,
@@ -199,19 +265,91 @@ func (e *Engine) buildArtifactConfig(env ChatEnv, entry *sessionEntry, req ChatC
 			if cid == "" && entry != nil {
 				cid = entry.client.GetSessionInfo().ConversationID
 			}
-			return env.absolute(fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", cid, fileID))
+			return e.imageArtifactURL(env, authID, cid, fileID)
 		},
 		BuildSandboxURL: func(messageID, sandboxPath string) string {
-			return env.absolute(fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
-				convID, messageID, url.QueryEscape(sandboxPath)))
+			return e.sandboxArtifactURL(env, authID, convID, messageID, sandboxPath)
 		},
 	}
 }
 
+// persistArtifacts 结果就位后把本轮产物写进产物存储：
+//   - 先用最终的会话 ID 补齐映射（流中登记时会话 ID 可能还没拿到）；
+//   - 图片同步下载写缓存（内联 base64 与后续访问都靠这份字节），最多 4 张并行；
+//   - 沙箱文件后台下载，不阻塞响应。
+//
+// 任何一步失败都只记日志：映射已在，链接照发，访问时按映射回源。
+func (e *Engine) persistArtifacts(env ChatEnv, entry *sessionEntry, result *sentinel.ChatResult, convID string) {
+	if e.store == nil || result == nil || entry == nil || convID == "" {
+		return
+	}
+	authID := env.AuthID
+	if authID == "" {
+		authID = entry.authID
+	}
+
+	fileIDs := result.ImageFileIDs
+	if len(fileIDs) == 0 && result.ImageFileID != "" {
+		fileIDs = []string{result.ImageFileID}
+	}
+	if result.ExpectGeneratedImages && len(fileIDs) > 0 {
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 4)
+		for _, fileID := range fileIDs {
+			e.imageArtifactURL(env, authID, convID, fileID) // 补齐 ConvID / AuthID
+			id := ChatGPTImageArtifactID(fileID)
+			if e.store.Cached(id) {
+				continue
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(fileID, id string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				data, mimeType, err := entry.client.DownloadFileByFileID(convID, fileID)
+				if err != nil || len(data) == 0 {
+					fmt.Printf("[artifact] 生图 %s 预下载失败（访问时回源）: %v\n", fileID, err)
+					return
+				}
+				if err := e.store.PutBytes(id, data, mimeType); err != nil {
+					fmt.Printf("[artifact] 生图 %s 写缓存失败: %v\n", fileID, err)
+				}
+			}(fileID, id)
+		}
+		wg.Wait()
+	}
+
+	for _, f := range sandboxFilesForHandler(result) {
+		msgID := f.MessageID
+		if msgID == "" {
+			msgID = result.LastAssistantMsgID
+		}
+		e.sandboxArtifactURL(env, authID, convID, msgID, f.SandboxPath)
+		id := SandboxArtifactID(convID, msgID, f.SandboxPath)
+		if e.store.Cached(id) {
+			continue
+		}
+		go func(msgID, sandboxPath, id string) {
+			data, mimeType, err := entry.client.DownloadSandboxFile(convID, msgID, sandboxPath)
+			if err != nil || len(data) == 0 {
+				fmt.Printf("[artifact] 沙箱文件 %s 预下载失败（访问时回源）: %v\n", sandboxPath, err)
+				return
+			}
+			if err := e.store.PutBytes(id, data, mimeType); err != nil {
+				fmt.Printf("[artifact] 沙箱文件 %s 写缓存失败: %v\n", sandboxPath, err)
+			}
+		}(msgID, f.SandboxPath, id)
+	}
+}
+
 // artifactMarkdown 把生图与沙箱产物整理成 markdown 链接，供不认 sentinel 扩展字段的标准客户端展示。
-func (e *Engine) artifactMarkdown(env ChatEnv, req ChatCompletionRequest, result *sentinel.ChatResult, convID string) string {
+func (e *Engine) artifactMarkdown(env ChatEnv, entry *sessionEntry, req ChatCompletionRequest, result *sentinel.ChatResult, convID string) string {
 	if !req.wantArtifactMarkdown() {
 		return ""
+	}
+	authID := env.AuthID
+	if authID == "" && entry != nil {
+		authID = entry.authID
 	}
 	var b strings.Builder
 
@@ -219,12 +357,10 @@ func (e *Engine) artifactMarkdown(env ChatEnv, req ChatCompletionRequest, result
 		switch {
 		case len(result.ImageFileIDs) > 0:
 			for i, fileID := range result.ImageFileIDs {
-				rel := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", convID, fileID)
-				fmt.Fprintf(&b, "\n\n![Generated Image %d](%s)", i+1, env.absolute(rel))
+				fmt.Fprintf(&b, "\n\n![Generated Image %d](%s)", i+1, e.imageArtifactURL(env, authID, convID, fileID))
 			}
 		case result.ImageFileID != "":
-			rel := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", convID, result.ImageFileID)
-			fmt.Fprintf(&b, "\n\n![Generated Image](%s)", env.absolute(rel))
+			fmt.Fprintf(&b, "\n\n![Generated Image](%s)", e.imageArtifactURL(env, authID, convID, result.ImageFileID))
 		case result.ImagePath != "":
 			p := result.ImagePath
 			if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") {
@@ -238,13 +374,15 @@ func (e *Engine) artifactMarkdown(env ChatEnv, req ChatCompletionRequest, result
 	}
 
 	for i, f := range sandboxFilesForHandler(result) {
-		rel := fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
-			convID, f.MessageID, url.QueryEscape(f.SandboxPath))
+		msgID := f.MessageID
+		if msgID == "" {
+			msgID = result.LastAssistantMsgID
+		}
 		label := f.FileName
 		if label == "" {
 			label = fmt.Sprintf("file_%d", i+1)
 		}
-		fmt.Fprintf(&b, "\n\n[%s](%s)", label, env.absolute(rel))
+		fmt.Fprintf(&b, "\n\n[%s](%s)", label, e.sandboxArtifactURL(env, authID, convID, msgID, f.SandboxPath))
 	}
 	return b.String()
 }
@@ -304,13 +442,14 @@ func (e *Engine) Complete(env ChatEnv, req ChatCompletionRequest) (*ChatCompleti
 		turn.entry.client.FinishImageGenWS(result, turn.opts)
 	}
 	turn.entry.client.EmitNewArtifacts(turn.opts.Artifacts, result)
+	e.persistArtifacts(env, turn.entry, result, result.ConversationID)
 
 	content := result.Text
 	sentinel.LogContentPreview(func(format string, args ...interface{}) {
 		fmt.Printf("[chat-response] "+format+"\n", args...)
 	}, "client-body", content)
 
-	content += e.artifactMarkdown(env, req, result, result.ConversationID)
+	content += e.artifactMarkdown(env, turn.entry, req, result, result.ConversationID)
 
 	return &ChatCompletionResponse{
 		ID:      turn.chatID,
@@ -443,13 +582,14 @@ func (e *Engine) Stream(env ChatEnv, req ChatCompletionRequest, emit func(ChatCo
 	}
 	// 兜底：沙箱等未在流中推送的产物
 	turn.entry.client.EmitNewArtifacts(turn.opts.Artifacts, result)
+	e.persistArtifacts(env, turn.entry, result, registeredConvID)
 
 	fmt.Printf("[chat-done] model=%s conv=%s expect_img=%v image_ids=%v %s text_len=%d streamed=%d\n",
 		turn.apiModel, result.ConversationID, result.ExpectGeneratedImages, result.ImageFileIDs,
 		result.ImageGenDiagSummary(), len(result.Text), streamedToClient.Len())
 
 	// 兼容：可选 markdown 链接（旧客户端）
-	if md := e.artifactMarkdown(env, req, result, registeredConvID); md != "" {
+	if md := e.artifactMarkdown(env, turn.entry, req, result, registeredConvID); md != "" {
 		emit(chunk(Delta{Content: md}, nil))
 	}
 

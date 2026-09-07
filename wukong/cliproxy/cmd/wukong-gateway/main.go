@@ -20,6 +20,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	sdkapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/api"
@@ -43,7 +44,7 @@ func env(key, def string) string {
 }
 
 func main() {
-	cfgPath := env("CLIPROXY_CONFIG", "config.yaml")
+	cfgPath, rest := resolveConfigPath()
 
 	cfg, err := sdkconfig.LoadConfig(cfgPath)
 	if err != nil {
@@ -51,8 +52,8 @@ func main() {
 	}
 
 	// login 子命令只做 OAuth 并写凭证文件，不起网关。
-	if len(os.Args) > 1 && os.Args[1] == "login" {
-		if err = runLogin(context.Background(), cfg, os.Args[2:]); err != nil {
+	if len(rest) > 0 && rest[0] == "login" {
+		if err = runLogin(context.Background(), cfg, rest[1:]); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -93,12 +94,34 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// 产物存储：持久映射 + 磁盘缓存（见 wukong/docs/ARTIFACT_STORE_PLAN.md）。
+	// 生图 / 沙箱文件 / Grok 图片视频统一改成 <ARTIFACT_BASE_URL>/files/<id>，不再依赖内存会话，
+	// 也不再向客户端透传需要登录态的上游直链。初始化失败只降级回旧的会话代理链接。
+	var artifactStore *sentinelserver.ArtifactStore
+	if s, errStore := sentinelserver.NewArtifactStoreFromConfig(&sentinelCfg); errStore != nil {
+		log.Printf("[startup] 警告：产物存储初始化失败，退回会话代理链接: %v", errStore)
+	} else {
+		artifactStore = s
+		engine.SetArtifactStore(artifactStore)
+		artifactStore.StartCleanup(ctx)
+		log.Printf("[startup] 产物存储 dir=%s public=%s max=%dMB", sentinelCfg.ArtifactDir, artifactStore.PublicPath(), sentinelCfg.ArtifactMaxTotalMB)
+	}
+	absoluteURL := func(p string) string {
+		if strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") {
+			return p
+		}
+		return strings.TrimRight(gatewayBase, "/") + p
+	}
+
 	tokenStore := sdkAuth.NewFileTokenStore()
 	tokenStore.SetBaseDir(cfg.AuthDir)
 	core := coreauth.NewManager(tokenStore, nil, nil)
 	exec := glue.NewExecutor(engine, gatewayBase)
 	exec.SetOAuthConfig(sentinelCfg.OAuthTokenURL, sentinelCfg.OAuthClientID)
 	core.RegisterExecutor(exec)
+	if artifactStore != nil {
+		artifactStore.RegisterFetcher(sentinelserver.ArtifactProviderChatGPT, glue.NewChatGPTArtifactFetcher(core, &sentinelCfg))
+	}
 
 	// svc 在 Build 之后才有；运行时增删账号后要用它触发一次模型重注册。
 	var svc *sdkcliproxy.Service
@@ -115,6 +138,10 @@ func main() {
 	})
 	grokCfg.OnClearanceUpdate = grokAccounts.ApplyClearanceUpdate
 	grokExec := glue.NewGrokExecutor(grokCfg)
+	if artifactStore != nil {
+		grokExec.SetArtifactStore(artifactStore, absoluteURL, time.Duration(sentinelCfg.ArtifactVideoTimeoutSec)*time.Second)
+		artifactStore.RegisterFetcher(sentinelserver.ArtifactProviderGrok, glue.NewGrokArtifactFetcher(core, grokCfg))
+	}
 	core.RegisterExecutor(grokExec)
 
 	// 把两条网页逆向注册为 cliproxy 的进程内原生 provider：executor 绑定与模型注册
@@ -167,7 +194,8 @@ func main() {
 			// 这些路由注册在根引擎、不进 cliproxy 的 api-key 鉴权组（图片链接要能被
 			// 末端客户端直接取）。cliproxy 无 /api/*、/images、/chatgpt、/grok，不冲突。
 			sdkapi.WithRouterConfigurator(func(ginEngine *gin.Engine, _ *sdkapihandlers.BaseAPIHandler, _ *sdkconfig.Config) {
-				sentinelserver.RegisterArtifactAndAdminRoutes(ginEngine, &sentinelCfg, nil, session, nil, chatgptAccounts, grokAccounts)
+				sentinelserver.RegisterArtifactAndAdminRoutes(ginEngine, &sentinelCfg, nil, session, nil, chatgptAccounts, grokAccounts,
+					sentinelserver.WithArtifactStore(artifactStore))
 			}),
 		).
 		WithHooks(sdkcliproxy.Hooks{

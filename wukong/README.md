@@ -43,6 +43,10 @@ $env:CHATGPT_FILE    = "chatgpt.json"   # 仅启动时一次性迁到 auth-dir�
 $env:GROK_FILE       = "grok.json"      # 仅启动时一次性迁到 auth-dir；日常灌号走 /grok
 # 生图链接默认指向网关自身（config 的 host:port）。对外部署时设成末端可达地址：
 # $env:ARTIFACT_BASE_URL = "https://your.domain"
+# 临时模式默认关闭，ChatGPT / Grok 新会话都是普通会话（进官网历史、可用账号记忆）。
+# 想隔离账号级跨会话记忆再打开；GROK_TEMP_MODE 没设时沿用 TEMP_MODE：
+# $env:TEMP_MODE      = "true"   # ChatGPT：history_and_training_disabled；生图与项目对话自动豁免
+# $env:GROK_TEMP_MODE = "true"   # Grok：session.create 带 is_temporary + disable_memory
 ./scp.exe
 ```
 
@@ -53,8 +57,51 @@ $env:GROK_FILE       = "grok.json"      # 仅启动时一次性迁到 auth-dir�
   管理 `/chatgpt`（旧名 `/tokens`）、`/grok`，由 wukong 直接挂在同一个 gin 引擎的**根路由、
   免 api-key**（图片链接要能被末端客户端直接取；灌号 Grok 会热更新 `grok-web`）。
 
-模型名：ChatGPT 侧 `gpt-5-*` / `o3` / `dall-e-3`（运行时从官网目录拉取）；Grok 侧
-`grok-chat-*` / `grok-imagine-*`。与官方 `codex` / `xai` 内置 provider 不重叠。
+模型名：ChatGPT 侧 `chatgpt-web/gpt-5-*`（运行时从官网 `/backend-api/models` 拉取，可配强度的
+slug 另暴露 `-standard` / `-extended`）和 `chatgpt-web/dall-e-3`（生图触发名，不在官网目录里，
+后端以 `picture_v2` 直调图像工具）；Grok 侧 `grok-web/grok-chat-*` / `grok-web/grok-imagine-*`。
+
+前缀走的是 cliproxy 自带的凭证 `prefix` 机制：`/chatgpt/upload`、`/grok/upload` 与旧文件迁移写入的
+凭证默认带 `prefix: chatgpt-web` / `grok-web`，模型因此注册为 `<prefix>/<model>`，请求时自动剥掉；
+config 里 `force-model-prefix: true` 让无前缀旧名（`gpt-5-6-thinking`、`dall-e-3`）不再出现，
+这样和 `codex` / `xai` 内置 provider 的官方 API 模型（`gpt-5.5`、`gpt-image-2`、`grok-4.6`）在
+`/v1/models` 里一眼分开。升级前灌的老凭证文件没有 `prefix` 字段，在面板凭证卡里补上，或手工往
+JSON 里加 `"prefix": "chatgpt-web"`（Grok 为 `"grok-web"`）；想换前缀也在这里改。
+
+## 产物存储：图片 / 文件 / 视频链接
+
+网页通道生成的产物（ChatGPT 生图、Code Interpreter 沙箱文件、Grok 图片与视频）对外统一是
+`<ARTIFACT_BASE_URL>/files/<id>.<ext>`，不再有 `assets.grok.com` 直链（需要登录 cookie，匿名 403），
+也不再依赖内存会话（旧的 `/api/image/proxy` 两小时或重启后 404）。设计与分期见
+`docs/ARTIFACT_STORE_PLAN.md`，实现在 `server/artifact_*.go`、`cliproxy/artifact_fetchers.go`。
+
+两层结构：
+
+- **映射表**（`ARTIFACT_DIR/index.jsonl`，追加写、不清理）：每个产物属于哪个 provider、哪个凭证
+  （`auth-dir` 文件名）、在上游怎么定位（ChatGPT 的 `conv_id + file_id` / `msg_id + sandbox_path`，
+  Grok 的原始 URL）。生成侧先登记再发链接。**要纳入备份**——它丢了，未缓存的产物就无法回源。
+- **磁盘缓存**（`ARTIFACT_DIR/<id>.<ext>`）：图片在响应前同步下载，视频 / 沙箱文件后台预下载；
+  受 `ARTIFACT_MAX_TOTAL_MB` 约束按最旧优先清理，**只删字节不删映射**。
+
+访问 `GET /files/<id>.<ext>` 三级取回：缓存命中直出（immutable、支持 Range）→ 缓存缺失按映射用该凭证
+回源并写回（响应头 `X-Artifact-Source: upstream`）→ 映射也没有则 404。回源**不跨账号**：ChatGPT 与
+Grok 的文件都只对创建它的账号开放，凭证被删就 502。旧的 `/api/image/proxy`、`/api/pdf/proxy` 变成兼容
+别名：映射命中走同一条链，命中不了才退回会话代理并顺手回填。
+
+环境变量（都有默认值，不配也能跑）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `ARTIFACT_DIR` | `artifacts` | 缓存目录（相对工作目录） |
+| `ARTIFACT_INDEX_PATH` | `<ARTIFACT_DIR>/index.jsonl` | 映射表 |
+| `ARTIFACT_PUBLIC_PATH` | `/files` | 对外路径前缀 |
+| `ARTIFACT_MAX_TOTAL_MB` | `2048` | 缓存总大小上限，`0` 不限 |
+| `ARTIFACT_MAX_AGE_DAYS` | `0` | 缓存按天清理，`0` 不限 |
+| `ARTIFACT_FETCH_TIMEOUT_SEC` | `60` | 访问时回源单次超时 |
+| `ARTIFACT_VIDEO_TIMEOUT_SEC` | `120` | Grok 视频后台预下载超时（超时不影响链接，访问时再回源） |
+| `ARTIFACT_BASE_URL` | 网关自身 | 链接前缀，对外部署必须设成末端客户端可达的地址 |
+
+`/files/*` 与旧的产物代理一样免 api-key，靠不可枚举的 ID（官网 `file_id` / 资源 UUID / 哈希）保护。
 
 ## 账号池：现状与刷新蓝图
 

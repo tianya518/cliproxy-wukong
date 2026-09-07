@@ -11,6 +11,7 @@ type ChatHandler struct {
 	cfg     *ServerConfig
 	engine  *Engine
 	session *SessionManager
+	store   *ArtifactStore // 可为空：没有产物存储时代理只走会话
 }
 
 // NewChatHandler 创建 ChatHandler。

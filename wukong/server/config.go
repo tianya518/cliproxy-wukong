@@ -17,9 +17,9 @@ type ServerConfig struct {
 
 	// ChatGPT 客户端默认参数
 	DefaultModel string // 默认模型，默认 gpt-5-5
-	// TempMode 临时模式（不保存对话历史、不更新账号记忆），默认 true。
-	// 默认开启是为了隔离账号级跨会话记忆——否则 ChatGPT 会把先前无关请求的内容
-	// 带进新会话，造成串味。生图请求会自动豁免（见 handler_chat.go）。
+	// TempMode 临时模式（不保存对话历史、不更新账号记忆），默认 false，即普通会话。
+	// 设 TEMP_MODE=true 可隔离账号级跨会话记忆——否则 ChatGPT 可能把先前无关请求的
+	// 内容带进新会话。开启后生图与项目对话仍会自动豁免（见 engine.go）。
 	TempMode bool
 	ImageDir string // 图片保存目录，默认 images
 
@@ -49,6 +49,15 @@ type ServerConfig struct {
 	// refresh_token 换 AT 的 OAuth 端点与 client_id（留空用默认 auth.openai.com）
 	OAuthTokenURL string
 	OAuthClientID string
+
+	// 产物存储（见 docs/ARTIFACT_STORE_PLAN.md）：持久映射 + 磁盘缓存。
+	ArtifactDir             string // 缓存目录，默认 artifacts
+	ArtifactIndexPath       string // 映射表文件，默认 <ArtifactDir>/index.jsonl
+	ArtifactPublicPath      string // 对外路径前缀，默认 /files
+	ArtifactMaxTotalMB      int    // 缓存总大小上限（MB），默认 2048；<=0 不限
+	ArtifactMaxAgeDays      int    // 缓存按天清理，默认 0 不限
+	ArtifactFetchTimeoutSec int    // 访问时回源单次超时，默认 60
+	ArtifactVideoTimeoutSec int    // Grok 视频后台预下载超时，默认 120
 }
 
 // LoadConfig 从环境变量加载配置
@@ -57,7 +66,7 @@ func LoadConfig() ServerConfig {
 		Port:                 getEnv("PORT", "5005"),
 		Authorization:        getEnv("AUTHORIZATION", ""),
 		DefaultModel:         getEnv("DEFAULT_MODEL", "gpt-5-5-thinking"),
-		TempMode:             getEnvBool("TEMP_MODE", true),
+		TempMode:             getEnvBool("TEMP_MODE", false),
 		ImageDir:             getEnv("IMAGE_DIR", "images"),
 		ChatGPTFile:          resolveChatGPTFile(),
 		GrokFile:             getEnv("GROK_FILE", "grok.json"),
@@ -68,6 +77,14 @@ func LoadConfig() ServerConfig {
 		RefreshLoopSec:       getEnvInt("REFRESH_LOOP_SEC", 1800),
 		OAuthTokenURL:        getEnv("OAUTH_TOKEN_URL", ""),
 		OAuthClientID:        getEnv("OAUTH_CLIENT_ID", ""),
+
+		ArtifactDir:             getEnv("ARTIFACT_DIR", "artifacts"),
+		ArtifactIndexPath:       getEnv("ARTIFACT_INDEX_PATH", ""),
+		ArtifactPublicPath:      getEnv("ARTIFACT_PUBLIC_PATH", "/files"),
+		ArtifactMaxTotalMB:      getEnvInt("ARTIFACT_MAX_TOTAL_MB", 2048),
+		ArtifactMaxAgeDays:      getEnvInt("ARTIFACT_MAX_AGE_DAYS", 0),
+		ArtifactFetchTimeoutSec: getEnvInt("ARTIFACT_FETCH_TIMEOUT_SEC", 60),
+		ArtifactVideoTimeoutSec: getEnvInt("ARTIFACT_VIDEO_TIMEOUT_SEC", 120),
 	}
 }
 

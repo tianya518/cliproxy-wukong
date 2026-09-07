@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -80,8 +81,8 @@ func (c *Client) runTurn(ctx context.Context, req ChatRequest, emit func(StreamD
 		if genErr != nil {
 			return nil, genErr
 		}
-		result.Images = images.URLs
-		result.Text = imageMarkdown(images.URLs)
+		result.Images = c.rewriteAssets(ctx, AssetKindImage, images.URLs)
+		result.Text = imageMarkdown(result.Images)
 		if emit != nil {
 			emit(StreamDelta{Kind: "text", Text: result.Text})
 		}
@@ -104,8 +105,8 @@ func (c *Client) runTurn(ctx context.Context, req ChatRequest, emit func(StreamD
 		if editErr != nil {
 			return nil, editErr
 		}
-		result.Images = images.URLs
-		result.Text = imageMarkdown(images.URLs)
+		result.Images = c.rewriteAssets(ctx, AssetKindImage, images.URLs)
+		result.Text = imageMarkdown(result.Images)
 		if emit != nil {
 			emit(StreamDelta{Kind: "text", Text: result.Text})
 		}
@@ -119,9 +120,10 @@ func (c *Client) runTurn(ctx context.Context, req ChatRequest, emit func(StreamD
 		if vidErr != nil {
 			return nil, vidErr
 		}
-		result.VideoURL = video.URL
+		result.VideoURL = c.rewriteAsset(ctx, AssetKindVideo, video.URL)
 		result.ConversationID = video.Conversation
-		result.Text = "![Generated Video](" + video.URL + ")"
+		// 视频用普通链接而不是图片语法：<img> 不会播放 mp4，普通链接至少可点开 / 下载。
+		result.Text = videoMarkdown(result.VideoURL)
 		if emit != nil {
 			emit(StreamDelta{Kind: "text", Text: result.Text})
 		}
@@ -158,7 +160,7 @@ func (c *Client) runTurn(ctx context.Context, req ChatRequest, emit func(StreamD
 			return nil
 		}
 		if kind == "image" {
-			emit(StreamDelta{Kind: "image", Image: delta})
+			emit(StreamDelta{Kind: "image", Image: c.rewriteAsset(ctx, AssetKindImage, delta)})
 			return nil
 		}
 		if kind == "text" && sieve != nil {
@@ -196,9 +198,10 @@ func (c *Client) runTurn(ctx context.Context, req ChatRequest, emit func(StreamD
 	}
 	result.ConversationID = parsed.ConversationID
 	result.ParentID = parsed.ParentID
-	result.Text = parsed.Text.String()
+	// 正文里若夹带上游资源直链（模型偶尔把图当 markdown 写进正文），一并改写。
+	result.Text = c.rewriteAssetLinksInText(ctx, parsed.Text.String())
 	result.Reasoning = parsed.Reasoning.String()
-	result.Images = parsed.Images
+	result.Images = c.rewriteAssets(ctx, AssetKindImage, parsed.Images)
 	result.ToolCalls = parsed.ToolCalls
 	result.SearchSources = parsed.SearchSources
 	if len(parsed.ToolCalls) > 0 {
@@ -243,6 +246,29 @@ func imageMarkdown(urls []string) string {
 		fmt.Fprintf(&b, "![Generated Image %d](%s)", i+1, raw)
 	}
 	return b.String()
+}
+
+// videoMarkdown 视频用普通链接：markdown 图片语法渲染成 <img>，浏览器不会播放 mp4。
+func videoMarkdown(url string) string {
+	return "[Generated Video](" + url + ")"
+}
+
+// assetLinkRe 匹配正文里的上游资源直链（只认受信资源域名）。
+var assetLinkRe = regexp.MustCompile(`https://(?:assets\.grok\.com|imagine-public\.x\.ai|imgen\.x\.ai)/[^\s<>()\[\]"']+`)
+
+// rewriteAssetLinksInText 把正文里的上游资源直链逐个过钩子；钩子为空时原样返回。
+func (c *Client) rewriteAssetLinksInText(ctx context.Context, text string) string {
+	if c == nil || c.assetRewriter == nil || text == "" || !strings.Contains(text, "://") {
+		return text
+	}
+	return assetLinkRe.ReplaceAllStringFunc(text, func(raw string) string {
+		kind := AssetKindImage
+		lower := strings.ToLower(raw)
+		if strings.HasSuffix(strings.SplitN(lower, "?", 2)[0], ".mp4") || strings.Contains(lower, "/content") {
+			kind = AssetKindVideo
+		}
+		return c.rewriteAsset(ctx, kind, raw)
+	})
 }
 
 func OpenAIChunk(id, model, role, content string, finish *string, conversationID string) map[string]any {

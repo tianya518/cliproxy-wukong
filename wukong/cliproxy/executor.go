@@ -86,7 +86,9 @@ func (x *Executor) env(ctx context.Context, auth *coreauth.Auth) (sentinelserver
 		Token: token,
 		// 凭证轮换与失败重试交给 cliproxy 的凭证池，这里不要再自己换票，
 		// 否则两层重试叠加会放大一次故障的请求量。
-		FromPool:    false,
+		FromPool: false,
+		// 产物映射记凭证 ID 而不是 token：缓存缺失时按 ID 找回当前有效凭证回源。
+		AuthID:      auth.ID,
 		AbsoluteURL: x.absoluteURL,
 	}, nil
 }

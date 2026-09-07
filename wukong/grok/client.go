@@ -24,6 +24,45 @@ type Client struct {
 	conversationID   string
 	parentResponseID string
 	resolvedUserID   string
+	// assetRewriter 把 assets.grok.com 之类的上游资源 URL 换成对外可访问的地址（由网关注入）。
+	// kind 为 "image" | "video"。为空时原样返回。
+	assetRewriter func(ctx context.Context, kind, rawURL string) string
+}
+
+// AssetKind 资源类型，SetAssetRewriter 回调的 kind 参数取值。
+const (
+	AssetKindImage = "image"
+	AssetKindVideo = "video"
+)
+
+// SetAssetRewriter 注入资源 URL 改写钩子。上游返回的 assets.grok.com 直链需要登录 cookie，
+// 不能直接交给客户端；网关用这个钩子把它登记进产物存储并换成自己的链接。
+func (c *Client) SetAssetRewriter(fn func(ctx context.Context, kind, rawURL string) string) {
+	if c != nil {
+		c.assetRewriter = fn
+	}
+}
+
+// rewriteAsset 单个 URL 过钩子；钩子为空或返回空时原样返回。
+func (c *Client) rewriteAsset(ctx context.Context, kind, rawURL string) string {
+	if c == nil || c.assetRewriter == nil || strings.TrimSpace(rawURL) == "" {
+		return rawURL
+	}
+	if out := strings.TrimSpace(c.assetRewriter(ctx, kind, rawURL)); out != "" {
+		return out
+	}
+	return rawURL
+}
+
+func (c *Client) rewriteAssets(ctx context.Context, kind string, urls []string) []string {
+	if c == nil || c.assetRewriter == nil || len(urls) == 0 {
+		return urls
+	}
+	out := make([]string, 0, len(urls))
+	for _, u := range urls {
+		out = append(out, c.rewriteAsset(ctx, kind, u))
+	}
+	return out
 }
 
 func NewClient(cfg Config, cred Credential) *Client {

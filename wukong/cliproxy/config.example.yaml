@@ -3,6 +3,11 @@
 # 注意这里**没有** openai-compatibility 段：ChatGPT / Grok 网页逆向都以
 # 进程内 provider 注册（chatgpt-web、grok-web），不再需要外部 HTTP 上游。
 # ChatGPT 凭证来自 chatgpt.json（旧名 tokens.json 仍可用），Grok SSO 来自 grok.json。
+#
+# wukong 自己的开关走环境变量而不是这个文件，部署时至少关注两个：
+#   ARTIFACT_BASE_URL=http://<对外地址>:<端口>   生图 / 文件 / 视频链接的前缀，必须是末端客户端可达的地址
+#   ARTIFACT_DIR=artifacts                       产物缓存目录（含映射表 index.jsonl，要纳入备份）
+# 其余 ARTIFACT_*（缓存上限、回源超时等）见 wukong/README.md「产物存储」一节。
 
 host: "127.0.0.1"
 port: 8317
@@ -14,6 +19,14 @@ api-keys:
   - "sk-local-test"
 
 debug: false
+
+# 网页逆向的凭证默认带模型前缀（/chatgpt/upload 写 prefix=chatgpt-web，/grok/upload 写 prefix=grok-web），
+# 模型因此以 chatgpt-web/gpt-5-6-thinking、grok-web/grok-chat-auto 的形式暴露，和 codex / xai 的
+# 官方 API 模型（gpt-5.5、gpt-image-2、grok-4.6）在列表里一眼分开。
+# 开启此项后带前缀的凭证只响应带前缀的模型名，无前缀旧名（gpt-5-6-thinking、dall-e-3）不再可用；
+# 无前缀的凭证（codex / xai 等）不受影响。老的凭证文件没有 prefix 字段，需在面板里补上或手工加
+# "prefix": "chatgpt-web" / "grok-web"。
+force-model-prefix: true
 
 remote-management:
   allow-remote: false

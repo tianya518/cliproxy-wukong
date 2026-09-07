@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	clipexec "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -22,10 +25,36 @@ const GrokProviderKey = "grok-web"
 type GrokExecutor struct {
 	cfg     grok.Config
 	clients sync.Map
+
+	// 产物存储（可为空）。挂上后 assets.grok.com 直链不再透传：登记映射 → 下载进缓存 → 换成 /files/<id>。
+	store        *sentinelserver.ArtifactStore
+	absoluteURL  func(string) string
+	videoTimeout time.Duration
 }
 
 func NewGrokExecutor(cfg grok.Config) *GrokExecutor {
 	return &GrokExecutor{cfg: cfg}
+}
+
+// SetArtifactStore 挂上产物存储。absoluteURL 把 /files/<id> 拼成对外可达的绝对地址；
+// videoTimeout 是视频后台预下载的超时（超时只影响预热，访问时仍会按映射回源）。
+func (x *GrokExecutor) SetArtifactStore(store *sentinelserver.ArtifactStore, absoluteURL func(string) string, videoTimeout time.Duration) {
+	if x == nil {
+		return
+	}
+	x.store = store
+	x.absoluteURL = absoluteURL
+	if videoTimeout <= 0 {
+		videoTimeout = 120 * time.Second
+	}
+	x.videoTimeout = videoTimeout
+	// 已缓存的 client 也要装上钩子。
+	x.clients.Range(func(key, value any) bool {
+		if client, ok := value.(*grok.Client); ok {
+			client.SetAssetRewriter(x.assetRewriter(key.(string), client))
+		}
+		return true
+	})
 }
 
 func (x *GrokExecutor) Identifier() string { return GrokProviderKey }
@@ -43,8 +72,69 @@ func (x *GrokExecutor) clientFor(auth *coreauth.Auth) (*grok.Client, error) {
 		return existing.(*grok.Client), nil
 	}
 	client := grok.NewClient(x.cfg, cred)
+	if x.store != nil {
+		client.SetAssetRewriter(x.assetRewriter(auth.ID, client))
+	}
 	actual, _ := x.clients.LoadOrStore(auth.ID, client)
 	return actual.(*grok.Client), nil
+}
+
+// assetRewriter 返回绑定到某凭证 / client 的 URL 改写钩子：
+//  1. 登记映射（provider=grok-web、凭证 ID、原始 URL）；
+//  2. 图片同步下载进缓存（内联 base64 也靠这份字节），视频后台预下载；
+//  3. 返回 /files/<id>.<ext>。任何失败都不回退到原链——映射已在，访问时回源。
+func (x *GrokExecutor) assetRewriter(authID string, client *grok.Client) func(ctx context.Context, kind, rawURL string) string {
+	return func(ctx context.Context, kind, rawURL string) string {
+		rawURL = strings.TrimSpace(rawURL)
+		if x.store == nil || rawURL == "" {
+			return rawURL
+		}
+		id := sentinelserver.GrokAssetArtifactID(rawURL)
+		ext := sentinelserver.ArtifactExtForName(rawURL)
+		recKind := sentinelserver.ArtifactKindImage
+		if kind == grok.AssetKindVideo {
+			recKind = sentinelserver.ArtifactKindVideo
+			if ext == "" {
+				ext = "mp4"
+			}
+		} else if ext == "" {
+			ext = "jpg"
+		}
+		rec := sentinelserver.ArtifactRecord{
+			ID: id, Ext: ext, Kind: recKind,
+			Provider: sentinelserver.ArtifactProviderGrok, AuthID: authID,
+			Locator: sentinelserver.ArtifactLocator{URL: rawURL},
+		}
+		if err := x.store.Record(rec); err != nil {
+			log.Printf("[artifact] 登记 Grok 资源映射失败，原链照发: %v", err)
+			return rawURL
+		}
+		if stored, ok := x.store.Lookup(id); ok {
+			rec = stored
+		}
+		if !x.store.Cached(id) {
+			if kind == grok.AssetKindVideo {
+				go x.prefetchAsset(context.Background(), client, id, rawURL, x.videoTimeout)
+			} else {
+				x.prefetchAsset(ctx, client, id, rawURL, 60*time.Second)
+			}
+		}
+		return x.store.PublicURL(x.absoluteURL, rec)
+	}
+}
+
+func (x *GrokExecutor) prefetchAsset(ctx context.Context, client *grok.Client, id, rawURL string, timeout time.Duration) {
+	fctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	body, mimeType, err := client.DownloadAsset(fctx, rawURL)
+	if err != nil {
+		log.Printf("[artifact] Grok 资源 %s 预下载失败（访问时回源）: %v", id, err)
+		return
+	}
+	defer body.Close()
+	if err := x.store.Put(id, body, mimeType); err != nil {
+		log.Printf("[artifact] Grok 资源 %s 写缓存失败: %v", id, err)
+	}
 }
 
 func toGrokRequest(req sentinelserver.ChatCompletionRequest) grok.ChatRequest {

@@ -30,14 +30,33 @@ type GrokAccountAdmin interface {
 	Quota(ctx context.Context, id string) []grok.AccountQuotaResult
 }
 
+// RouteOption 可选依赖。
+type RouteOption func(*routeOptions)
+
+type routeOptions struct {
+	store *ArtifactStore
+}
+
+// WithArtifactStore 挂上产物存储：注册 GET <publicPath>/:name，并让旧的 /api/*/proxy
+// 优先走存储（缓存命中直出、缺失按映射回源），命中不了才退回会话代理。
+func WithArtifactStore(store *ArtifactStore) RouteOption {
+	return func(o *routeOptions) { o.store = store }
+}
+
 // RegisterArtifactAndAdminRoutes 把产物代理与账号管理路由挂到给定路由器上。
 //
 // wukong-gateway 单一入口形态用它，把这批路由直接挂到 cliproxy 网关的 gin 引擎上。
-// 只注册 cliproxy 网关不提供、且与其现有路由不冲突的路径：产物代理 /api/*、静态
-// 图片 /images、ChatGPT 账号 /chatgpt|/tokens、Grok 账号 /grok。刻意不含 / 与 /v1/*
-// ——这些由 cliproxy 拥有。这些路由注册在网关根引擎、不进 api-key 鉴权组（图片链接
-// 要能被末端客户端直接取；账号管理接口本就无鉴权，注意别暴露到公网）。
-func RegisterArtifactAndAdminRoutes(r gin.IRouter, cfg *ServerConfig, pool *TokenPool, session *SessionManager, grokStore *grok.AccountStore, chatgptAdmin ChatGPTAccountAdmin, grokAdmin GrokAccountAdmin) {
+// 只注册 cliproxy 网关不提供、且与其现有路由不冲突的路径：产物代理 /api/*、产物存储
+// /files（可选）、静态图片 /images、ChatGPT 账号 /chatgpt|/tokens、Grok 账号 /grok。
+// 刻意不含 / 与 /v1/*——这些由 cliproxy 拥有。这些路由注册在网关根引擎、不进 api-key
+// 鉴权组（图片链接要能被末端客户端直接取；账号管理接口本就无鉴权，注意别暴露到公网）。
+func RegisterArtifactAndAdminRoutes(r gin.IRouter, cfg *ServerConfig, pool *TokenPool, session *SessionManager, grokStore *grok.AccountStore, chatgptAdmin ChatGPTAccountAdmin, grokAdmin GrokAccountAdmin, opts ...RouteOption) {
+	var o routeOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
 	// ChatGPT 网页凭证。正式路径是 /chatgpt；/tokens 是旧名，两边同一套处理函数。
 	tokens := NewTokensHandler(pool, session, chatgptAdmin)
 	for _, prefix := range []string{"/chatgpt", "/tokens"} {
@@ -60,7 +79,15 @@ func RegisterArtifactAndAdminRoutes(r gin.IRouter, cfg *ServerConfig, pool *Toke
 
 	// 产物代理与静态图片
 	chat := NewChatHandler(cfg, pool, session)
+	chat.store = o.store
 	r.GET("/api/image/proxy", chat.HandleImageProxy)
 	r.GET("/api/pdf/proxy", chat.HandlePDFProxy)
 	r.Static("/images", cfg.ImageDir)
+
+	// 产物存储：持久映射 + 磁盘缓存，见 artifact_store.go。
+	if o.store != nil {
+		r.GET(o.store.PublicPath()+"/:name", func(c *gin.Context) {
+			o.store.Serve(c, c.Param("name"))
+		})
+	}
 }
