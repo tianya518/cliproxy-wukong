@@ -11,6 +11,15 @@ name: Sync upstream CLIProxyAPI
 #
 # 一次性前提（仓库 Settings → Actions → General → Workflow permissions）：
 #   勾选 “Allow GitHub Actions to create and approve pull requests”，否则开 PR 会 403。
+#
+# 关于 .github/workflows/：GitHub 不允许默认的 GITHUB_TOKEN 推送任何改动了工作流文件的分支
+# （“refusing to allow a GitHub App to create or update workflow … without `workflows` permission”）。
+# 上游偶尔会改自己的 release.yaml 等文件，同步分支带上就推不上去。这里按是否配置了 secret
+# SYNC_PAT 走两条路：
+#   - 有 SYNC_PAT（fine-grained PAT，仓库限定，Contents / Pull requests / Issues / Workflows 读写）：
+#     用它 checkout 与推送，上游工作流改动照常同步进来；
+#   - 没有：合并后把 .github/workflows/ 恢复成 main 的版本再推（冲突也按此处理），
+#     上游那几份工作流在本 fork 里本来就不会触发（只在推 tag / 非 bot 开 PR 时运行），停在旧版无碍。
 
 on:
   schedule:
@@ -34,6 +43,8 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+          # 有 SYNC_PAT 就用它，后续 git push 才有 workflows 权限；没有则退回默认令牌。
+          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Set up Go（版本跟随 go.mod）
         uses: actions/setup-go@v5
@@ -66,6 +77,8 @@ jobs:
         id: merge
         env:
           NEW: ${{ steps.v.outputs.latest }}
+          # 'true' / 'false'：有没有配置 SYNC_PAT。没有就不能把工作流文件的改动推上去。
+          HAS_PAT: ${{ secrets.SYNC_PAT != '' }}
         run: |
           set -uo pipefail
           git config user.name  "wukong-sync-bot"
@@ -78,13 +91,36 @@ jobs:
 
           # 把上游新 tag merge 进来
           if ! git merge --no-edit "$NEW"; then
-            # 自动解冲突：仅当未合并文件全是 go.mod/go.sum 时，取上游版 + go mod tidy
+            # 自动解冲突：
+            #   - go.mod / go.sum：取上游版 + go mod tidy；
+            #   - .github/workflows/*（仅在没有 SYNC_PAT 时）：取 main 的版本，反正推不上去；
+            #   - 其它文件：放弃，开 issue 让人处理。
             unmerged=$(git diff --name-only --diff-filter=U | sort -u)
-            non_gomod=$(printf '%s\n' "$unmerged" | grep -vE '^(go\.mod|go\.sum)$' || true)
-            if [ -n "$unmerged" ] && [ -z "$non_gomod" ]; then
-              git checkout "$NEW" -- go.mod go.sum
-              go mod tidy
-              git add go.mod go.sum
+            gomod=$(printf '%s\n' "$unmerged" | grep -E '^(go\.mod|go\.sum)$' || true)
+            workflows=""
+            others=$(printf '%s\n' "$unmerged" | grep -vE '^(go\.mod|go\.sum)$' || true)
+            if [ "$HAS_PAT" != "true" ]; then
+              workflows=$(printf '%s\n' "$unmerged" | grep -E '^\.github/workflows/' || true)
+              others=$(printf '%s\n' "$others" | grep -vE '^\.github/workflows/' || true)
+            fi
+            others=$(printf '%s\n' "$others" | sed '/^$/d')
+            if [ -n "$unmerged" ] && [ -z "$others" ]; then
+              if [ -n "$gomod" ]; then
+                git checkout "$NEW" -- go.mod go.sum
+                go mod tidy
+                git add go.mod go.sum
+              fi
+              if [ -n "$workflows" ]; then
+                # 冲突的工作流文件：main 里有的取 main 版，main 里没有的（上游新增）删掉。
+                printf '%s\n' "$workflows" | while IFS= read -r f; do
+                  [ -z "$f" ] && continue
+                  if git cat-file -e "main:$f" 2>/dev/null; then
+                    git checkout main -- "$f"
+                  else
+                    git rm -q -f -- "$f"
+                  fi
+                done
+              fi
               git commit --no-edit
             else
               {
@@ -95,6 +131,19 @@ jobs:
               } >> "$GITHUB_OUTPUT"
               git merge --abort || true
               exit 0
+            fi
+          fi
+
+          # 没有 SYNC_PAT：把 .github/workflows/ 整体恢复成 main 的版本（含删掉上游新增的文件），
+          # 否则默认令牌推不上去。有 SYNC_PAT 时保留上游改动。
+          if [ "$HAS_PAT" != "true" ]; then
+            git rm -r -q --cached .github/workflows
+            rm -rf .github/workflows
+            git checkout main -- .github/workflows
+            git add -A .github/workflows
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: keep fork workflows unchanged (no workflows permission for GITHUB_TOKEN)"
+              echo "上游改了 .github/workflows/，未配置 SYNC_PAT，已恢复为 main 的版本。"
             fi
           fi
 
