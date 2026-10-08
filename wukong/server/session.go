@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	sentinel "github.com/router-for-me/CLIProxyAPI/v7/wukong/sentinel"
+	sentinel "github.com/router-for-me/CLIProxyAPI/v8/wukong/sentinel"
 )
 
 // sessionEntry 单个会话条目

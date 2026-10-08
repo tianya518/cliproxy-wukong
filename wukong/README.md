@@ -10,7 +10,7 @@
 ## 仓库布局
 
 ```
-<repo root>/                         # 模块 github.com/router-for-me/CLIProxyAPI/v7（CLIProxyAPI 的 fork）
+<repo root>/                         # 模块 github.com/router-for-me/CLIProxyAPI/v8（CLIProxyAPI 的 fork）
 ├── sdk/ internal/ cmd/ ...          # 上游原样
 │   └── sdk/cliproxy/native_provider.go   # 补丁①：进程内 provider 注册表（新文件）
 │                                          # 补丁②③：service_executors.go / service_models.go 各一行钩子

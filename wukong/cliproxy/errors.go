@@ -14,8 +14,8 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/wukong/grok"
-	sentinelserver "github.com/router-for-me/CLIProxyAPI/v7/wukong/server"
+	"github.com/router-for-me/CLIProxyAPI/v8/wukong/grok"
+	sentinelserver "github.com/router-for-me/CLIProxyAPI/v8/wukong/server"
 )
 
 // requestError 请求自身的问题，与所选凭证无关。

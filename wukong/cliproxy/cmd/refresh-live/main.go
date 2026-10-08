@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 
-	glue "github.com/router-for-me/CLIProxyAPI/v7/wukong/cliproxy"
-	sentinelserver "github.com/router-for-me/CLIProxyAPI/v7/wukong/server"
+	glue "github.com/router-for-me/CLIProxyAPI/v8/wukong/cliproxy"
+	sentinelserver "github.com/router-for-me/CLIProxyAPI/v8/wukong/server"
 )
 
 func main() {

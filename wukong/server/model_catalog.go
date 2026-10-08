@@ -15,7 +15,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
-	sentinel "github.com/router-for-me/CLIProxyAPI/v7/wukong/sentinel"
+	sentinel "github.com/router-for-me/CLIProxyAPI/v8/wukong/sentinel"
 )
 
 // errNoTokenForCatalog 池内暂无可用凭证，拉取推迟到下一个周期。

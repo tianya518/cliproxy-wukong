@@ -15,9 +15,9 @@ package cliproxy
 // 也不用在 executor 里再剥前缀。
 
 import (
-	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
+	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
 
-	sentinel "github.com/router-for-me/CLIProxyAPI/v7/wukong/sentinel"
+	sentinel "github.com/router-for-me/CLIProxyAPI/v8/wukong/sentinel"
 )
 
 // fallbackModels 拉不到官网目录时对外暴露的最小集合。

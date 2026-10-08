@@ -12,7 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	sentinel "github.com/router-for-me/CLIProxyAPI/v7/wukong/sentinel"
+	sentinel "github.com/router-for-me/CLIProxyAPI/v8/wukong/sentinel"
 )
 
 // guessFileName 根据 MIME 类型猜测一个合适的文件名

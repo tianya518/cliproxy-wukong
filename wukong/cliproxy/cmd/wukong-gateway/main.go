@@ -23,17 +23,17 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	sdkapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/api"
-	sdkapihandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	sdkapi "github.com/router-for-me/CLIProxyAPI/v8/sdk/api"
+	sdkapihandlers "github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 
-	glue "github.com/router-for-me/CLIProxyAPI/v7/wukong/cliproxy"
-	"github.com/router-for-me/CLIProxyAPI/v7/wukong/grok"
-	"github.com/router-for-me/CLIProxyAPI/v7/wukong/panel"
-	sentinelserver "github.com/router-for-me/CLIProxyAPI/v7/wukong/server"
+	glue "github.com/router-for-me/CLIProxyAPI/v8/wukong/cliproxy"
+	"github.com/router-for-me/CLIProxyAPI/v8/wukong/grok"
+	"github.com/router-for-me/CLIProxyAPI/v8/wukong/panel"
+	sentinelserver "github.com/router-for-me/CLIProxyAPI/v8/wukong/server"
 )
 
 func env(key, def string) string {

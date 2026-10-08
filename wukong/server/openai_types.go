@@ -1,7 +1,7 @@
 package server
 
 import (
-	sentinel "github.com/router-for-me/CLIProxyAPI/v7/wukong/sentinel"
+	sentinel "github.com/router-for-me/CLIProxyAPI/v8/wukong/sentinel"
 )
 
 // ─── 请求类型 ────────────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@ package server
 import (
 	"strings"
 
-	sentinel "github.com/router-for-me/CLIProxyAPI/v7/wukong/sentinel"
+	sentinel "github.com/router-for-me/CLIProxyAPI/v8/wukong/sentinel"
 )
 
 func isAuthError(err error) bool {

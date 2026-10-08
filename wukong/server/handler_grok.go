@@ -9,7 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/wukong/grok"
+	"github.com/router-for-me/CLIProxyAPI/v8/wukong/grok"
 )
 
 // GrokHandler 管理 Grok Web SSO。网关形态走 GrokAccountAdmin（auth-dir）；

@@ -17,8 +17,8 @@ import (
 	"os"
 	"strings"
 
-	sdkauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	sdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 // codexDeviceFlow 是 CodexAuthenticator 约定的 metadata 开关，
