@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 
-	sentinelserver "github.com/router-for-me/CLIProxyAPI/v7/wukong/server"
+	sentinelserver "github.com/router-for-me/CLIProxyAPI/v8/wukong/server"
 )
 
 func TestRegisterAuthsFromChatGPTFile(t *testing.T) {

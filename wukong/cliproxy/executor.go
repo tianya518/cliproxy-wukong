@@ -19,11 +19,11 @@ import (
 	"strings"
 	"time"
 
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	clipexec "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktr "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	clipexec "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktr "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 
-	sentinelserver "github.com/router-for-me/CLIProxyAPI/v7/wukong/server"
+	sentinelserver "github.com/router-for-me/CLIProxyAPI/v8/wukong/server"
 )
 
 // ProviderKey 是本 provider 在 cliproxy 中的标识。

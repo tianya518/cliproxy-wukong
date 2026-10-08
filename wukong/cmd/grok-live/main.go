@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/wukong/grok"
+	"github.com/router-for-me/CLIProxyAPI/v8/wukong/grok"
 )
 
 func main() {

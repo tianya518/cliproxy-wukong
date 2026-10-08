@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/wukong/grok"
-	sentinelserver "github.com/router-for-me/CLIProxyAPI/v7/wukong/server"
+	"github.com/router-for-me/CLIProxyAPI/v8/wukong/grok"
+	sentinelserver "github.com/router-for-me/CLIProxyAPI/v8/wukong/server"
 )
 
 func TestGrokExecutorAttachInlineImages(t *testing.T) {

@@ -11,13 +11,13 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 type executorManager interface {
@@ -411,7 +411,16 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
 	nativeReq := req
 	nativeOpts := opts
 	if inputRequested != "" && inputRequested != inputFormat {
-		nativeReq.Payload = sdktranslator.TranslateRequest(inputRequested, inputFormat, req.Model, req.Payload, opts.Stream)
+		translated := sdktranslator.TranslateRequestEnvelope(context.Background(), inputRequested, inputFormat, sdktranslator.RequestEnvelope{
+			Format: inputRequested,
+			Model:  req.Model,
+			Stream: opts.Stream,
+			Body:   req.Payload,
+		})
+		if translated.Err != nil {
+			return preparedExecutorCall{}, translated.Err
+		}
+		nativeReq.Payload = translated.Body
 	}
 	nativeReq.Format = outputFormat
 	nativeOpts.SourceFormat = inputFormat

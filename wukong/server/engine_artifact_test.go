@@ -9,7 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	sentinel "github.com/router-for-me/CLIProxyAPI/v7/wukong/sentinel"
+	sentinel "github.com/router-for-me/CLIProxyAPI/v8/wukong/sentinel"
 )
 
 func testAbsolute(p string) string { return "http://gw.example" + p }

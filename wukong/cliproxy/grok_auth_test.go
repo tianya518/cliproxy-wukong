@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/wukong/grok"
+	"github.com/router-for-me/CLIProxyAPI/v8/wukong/grok"
 )
 
 func TestReplaceGrokAuthsKeepsChatGPT(t *testing.T) {

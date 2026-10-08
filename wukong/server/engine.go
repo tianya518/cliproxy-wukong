@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	sentinel "github.com/router-for-me/CLIProxyAPI/v7/wukong/sentinel"
+	sentinel "github.com/router-for-me/CLIProxyAPI/v8/wukong/sentinel"
 )
 
 // ErrNoInput 请求里既无文本也无图片，无法构成一轮对话。

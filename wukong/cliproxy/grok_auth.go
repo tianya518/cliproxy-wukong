@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/wukong/grok"
-	sentinelserver "github.com/router-for-me/CLIProxyAPI/v7/wukong/server"
+	"github.com/router-for-me/CLIProxyAPI/v8/wukong/grok"
+	sentinelserver "github.com/router-for-me/CLIProxyAPI/v8/wukong/server"
 )
 
 func grokCredentialFrom(auth *coreauth.Auth) (grok.Credential, error) {

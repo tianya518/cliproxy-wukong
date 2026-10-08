@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	clipexec "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	clipexec "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/wukong/grok"
-	sentinel "github.com/router-for-me/CLIProxyAPI/v7/wukong/sentinel"
-	sentinelserver "github.com/router-for-me/CLIProxyAPI/v7/wukong/server"
+	"github.com/router-for-me/CLIProxyAPI/v8/wukong/grok"
+	sentinel "github.com/router-for-me/CLIProxyAPI/v8/wukong/sentinel"
+	sentinelserver "github.com/router-for-me/CLIProxyAPI/v8/wukong/server"
 )
 
 // ChatGPT 的 access token 必须是 JWT（eyJ 开头、至少两个点），

@@ -10,14 +10,14 @@ import (
 	"sync"
 	"time"
 
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	clipexec "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktr "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	clipexec "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktr "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 
-	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
+	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/wukong/grok"
-	sentinelserver "github.com/router-for-me/CLIProxyAPI/v7/wukong/server"
+	"github.com/router-for-me/CLIProxyAPI/v8/wukong/grok"
+	sentinelserver "github.com/router-for-me/CLIProxyAPI/v8/wukong/server"
 )
 
 const GrokProviderKey = "grok-web"

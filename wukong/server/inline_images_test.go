@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	sentinel "github.com/router-for-me/CLIProxyAPI/v7/wukong/sentinel"
+	sentinel "github.com/router-for-me/CLIProxyAPI/v8/wukong/sentinel"
 )
 
 func seedImage(t *testing.T, s *ArtifactStore, id string, data []byte) {
