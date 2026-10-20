@@ -1,38 +1,26 @@
 package cliproxy
 
-// native_provider.go —— wukong 薄 fork 补丁：进程内原生 provider 注册表。
-//
-// 背景：以库形式接入的自定义 provider（如网页逆向 chatgpt-web / grok-web）不被
-// service 的重载路径认识。默认情况下 registerExecutorForAuth 会在 default 分支把它
-// 当成 openai-compatibility 套上 OpenAICompatExecutor（随后报 missing provider
-// baseURL），registerModelsForAuth 也会走到最后 UnregisterClient 把模型清掉。以往
-// 只能靠一个 2 秒自愈循环去“抢回”绑定，既脆又有暴露窗口。
-//
-// 本文件让编译进二进制的 Go provider 走和内置 provider 完全一样的重载路径：
-// service 在重绑 executor / 重注册模型时先问这张表，命中就用原生实现并早返回，
-// 因此 executor 绑定与模型注册天然在 config/auths 热重载中存活，不再需要外部抢回。
-//
-// 这是整个薄 fork 唯一的新增文件；配套改动只有 service_executors.go 与
-// service_models.go 各一行钩子（搜索 registerNativeExecutorForAuth /
-// registerNativeModelsForAuth 即可定位）。升级上游时新文件不会冲突，钩子是单行
-// 插入，rebase 成本极小。
+// The wukong fork registers in-process providers here so config and auth reloads
+// retain their native executors and models instead of replacing them with the
+// OpenAI compatibility fallback. The service_executors.go and service_models.go
+// hooks consult this registry before resolving built-in or plugin providers.
 
 import (
 	"strings"
 	"sync"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
-// NativeProvider 描述一个编译进二进制的进程内 provider。
+// NativeProvider describes an in-process provider compiled into the binary.
 type NativeProvider struct {
-	// Key 是 provider 标识，必须与 Auth.Provider 和 Executor.Identifier() 一致。
+	// Key must match Auth.Provider and Executor.Identifier().
 	Key string
-	// Executor 处理该 provider 所有凭证的执行（复用现成的 coreauth.ProviderExecutor）。
+	// Executor handles requests for all credentials of this provider.
 	Executor coreauth.ProviderExecutor
-	// Models 返回该 provider 当前的模型目录。每次（重）注册都会调用，
-	// 因此运行时变化的目录（如官网模型热更新）会在下一次注册时被采纳；
-	// 想主动推送变化可调用 Service.RefreshNativeProviderModels。可为 nil。
+	// Models returns the current catalog on every registration. It may be nil.
+	// Call Service.RefreshNativeProviderModels to publish catalog changes immediately.
 	Models func() []*ModelInfo
 }
 
@@ -41,8 +29,8 @@ var (
 	nativeProviders   = map[string]*NativeProvider{}
 )
 
-// RegisterNativeProvider 注册一个进程内 provider。可在 Build() 之前调用；
-// 用相同 Key 再次注册会替换旧项。Key 为空或 Executor 为 nil 时忽略。
+// RegisterNativeProvider registers or replaces a provider, including before Build.
+// An empty key or nil executor is ignored.
 func RegisterNativeProvider(p *NativeProvider) {
 	if p == nil {
 		return
@@ -69,9 +57,9 @@ func lookupNativeProvider(provider string) (*NativeProvider, bool) {
 	return p, ok
 }
 
-// registerNativeExecutorForAuth 在 auth 属于原生 provider 时把其 executor 绑上，
-// 返回 true 表示已接管、调用方应早返回（不要再走 openai-compat 回退）。
-// 幂等：重载多次只在绑定缺失或被换掉时重新注册。
+// registerNativeExecutorForAuth binds a native executor and reports whether it
+// handled the auth, preventing the OpenAI compatibility fallback. Rebinding is
+// needed only when the executor is missing or has been replaced.
 func (s *Service) registerNativeExecutorForAuth(a *coreauth.Auth) bool {
 	if s == nil || s.coreManager == nil || a == nil {
 		return false
@@ -86,26 +74,25 @@ func (s *Service) registerNativeExecutorForAuth(a *coreauth.Auth) bool {
 	return true
 }
 
-// registerNativeModelsForAuth 在 auth 属于原生 provider 时注册其模型，
-// 返回 true 表示已接管、调用方应早返回。空目录会走 UnregisterClient（复用内置逻辑）。
-func (s *Service) registerNativeModelsForAuth(a *coreauth.Auth, provider string) bool {
+// registerNativeModelsForAuthWithConfigFenced reports whether a native provider
+// handled registration and whether its publication fence accepted the result.
+// Empty catalogs use the same fenced removal path as built-in providers.
+func (s *Service) registerNativeModelsForAuthWithConfigFenced(cfg *config.Config, a *coreauth.Auth, fence modelRegistrationFence, provider string) (bool, bool) {
 	p, ok := lookupNativeProvider(provider)
 	if !ok {
-		return false
+		return false, true
 	}
 	var models []*ModelInfo
 	if p.Models != nil {
 		models = p.Models()
 	}
-	// 与内置 provider 一致地套用前缀策略，再交给同一个注册入口。
-	models = applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix)
-	s.registerResolvedModelsForAuth(a, p.Key, models)
-	return true
+	// Use the captured config and fence so a slow catalog cannot replace newer state.
+	models = applyModelPrefixes(models, a.Prefix, cfg != nil && cfg.ForceModelPrefix)
+	return true, s.registerResolvedModelsForAuthFenced(a, fence, p.Key, models)
 }
 
-// RefreshNativeProviderModels 为某原生 provider 的所有凭证重新注册模型。
-// 当该 provider 的模型目录在运行时变化（例如官网模型热更新）时调用，
-// 使 /v1/models 与路由立即采纳新目录，而不必等下一次 auth 事件。
+// RefreshNativeProviderModels registers the current catalog for every credential
+// of a native provider so model discovery and routing update without an auth event.
 func (s *Service) RefreshNativeProviderModels(providerKey string) {
 	if s == nil || s.coreManager == nil {
 		return

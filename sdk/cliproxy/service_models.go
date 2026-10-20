@@ -67,10 +67,10 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 		}
 	}
 	provider := strings.ToLower(strings.TrimSpace(a.Provider))
-	// wukong 薄 fork：进程内原生 provider 优先注册模型，绕开 openai-compat 推断与末尾 UnregisterClient。
-	// 详见 native_provider.go。
-	if s.registerNativeModelsForAuth(a, provider) {
-		return
+	// Let native providers register before OpenAI compatibility inference or removal.
+	// See native_provider.go.
+	if handled, published := s.registerNativeModelsForAuthWithConfigFenced(cfg, a, fence, provider); handled {
+		return published
 	}
 	compatProviderKey, compatDisplayName, compatDetected := openAICompatInfoFromAuth(a)
 	if compatDetected {
