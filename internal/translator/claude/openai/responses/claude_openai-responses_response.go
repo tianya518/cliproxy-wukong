@@ -17,7 +17,12 @@ import (
 
 type claudeToResponsesState struct {
 	translatorcommon.ApplyPatchErrorState
-	ApplyPatchCalls         map[string]*translatorcommon.ApplyPatchCallState
+	ApplyPatchCalls map[string]*translatorcommon.ApplyPatchCallState
+	// ToolSearch is upstream.claude.tool-search as pinned for this response.
+	ToolSearch bool
+	// RequestJSON is the validated request body picked once per stream;
+	// the per-chunk path reuses it instead of re-validating the full body.
+	RequestJSON             []byte
 	ToolWinners             map[string]responsesToolDescriptor
 	ToolNames               claudeToolNames
 	FuncItemAdded           map[int]bool
@@ -167,23 +172,57 @@ func claudeResponsesIncompleteDetails(stopReason string) ([]byte, bool) {
 	switch strings.ToLower(strings.TrimSpace(stopReason)) {
 	case "max_tokens":
 		return []byte(`{"reason":"max_output_tokens"}`), true
-	case "pause_turn":
-		// Anthropic's server-tool iteration pause is unfinished, not a token limit:
-		// https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons#pause_turn
-		// Responses has no matching incomplete reason, so keep its nullable details null.
-		return []byte(`null`), true
+	case "refusal":
+		// Safety classifiers stop the turn with a normal 200. Responses clients
+		// treat content_filter as a retryable refusal instead of a finished answer:
+		// https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons#refusal
+		return []byte(`{"reason":"content_filter"}`), true
 	}
 	return nil, false
 }
 
+// claudeStopReasonContextWindowExceeded reports the stop reason Anthropic uses
+// when the response filled the model's context window. Responses clients expect
+// that condition as a failed response with code context_length_exceeded.
+func claudeStopReasonContextWindowExceeded(stopReason string) bool {
+	return strings.EqualFold(strings.TrimSpace(stopReason), "model_context_window_exceeded")
+}
+
+// claudeStopReasonPauseTurn reports Anthropic's server-tool iteration pause.
+// The turn is unfinished but valid: the client continues it by sending the
+// paused assistant content back unchanged, so Responses ends the response as
+// completed with end_turn=false instead of an error:
+// https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons#pause_turn
+func claudeStopReasonPauseTurn(stopReason string) bool {
+	return strings.EqualFold(strings.TrimSpace(stopReason), "pause_turn")
+}
+
+// claudeResponsesContextWindowError is the Responses error object for
+// model_context_window_exceeded.
+func claudeResponsesContextWindowError() []byte {
+	return []byte(`{"code":"context_length_exceeded","message":"Claude stopped because the conversation filled the model context window (stop_reason: model_context_window_exceeded)."}`)
+}
+
+// claudeResponsesWebSearchStatus keeps a paused search that never received its
+// result in_progress, so the next request can send it back without a result.
+func claudeResponsesWebSearchStatus(stopReason, status string, hasResults bool) string {
+	if claudeStopReasonPauseTurn(stopReason) && !hasResults {
+		return "in_progress"
+	}
+	return status
+}
+
 func claudeResponsesOutputStatus(stopReason string) string {
-	if _, incomplete := claudeResponsesIncompleteDetails(stopReason); incomplete {
+	if _, incomplete := claudeResponsesIncompleteDetails(stopReason); incomplete || claudeStopReasonContextWindowExceeded(stopReason) {
 		return "incomplete"
 	}
 	return "completed"
 }
 
 func claudeResponsesTerminalState(stopReason string) (eventType, status string, incompleteDetails []byte) {
+	if claudeStopReasonContextWindowExceeded(stopReason) {
+		return "response.failed", "failed", nil
+	}
 	incompleteDetails, incomplete := claudeResponsesIncompleteDetails(stopReason)
 	if incomplete {
 		return "response.incomplete", "incomplete", incompleteDetails
@@ -201,8 +240,8 @@ func pickRequestJSON(originalRequestRawJSON, requestRawJSON []byte) []byte {
 	return nil
 }
 
-func applyResponsesFunctionCallNamespaceFields(item []byte, requestRawJSON []byte, qualifiedName string, itemPath string) []byte {
-	name, namespace := splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON, qualifiedName)
+func applyResponsesFunctionCallNamespaceFields(item []byte, requestRawJSON []byte, qualifiedName string, itemPath string, toolSearch bool) []byte {
+	name, namespace := splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON, qualifiedName, toolSearch)
 	return translatorcommon.SetResponsesToolCallIdentity(item, name, namespace, itemPath)
 }
 
@@ -280,6 +319,12 @@ func (st *claudeToResponsesState) isApplyPatch(name string) bool {
 	return ok && d.toolType == "custom" && applypatch.IsCustomTool(d.tool)
 }
 
+// isToolSearch reports whether a Claude tool name maps to the client
+// tool_search declaration.
+func (st *claudeToResponsesState) isToolSearch(name string) bool {
+	return st.ToolWinners[st.ToolNames.identity(name)].clientSearch
+}
+
 // validateApplyPatchSnapshots permits equivalent JSON spellings but never
 // silently replaces one complete patch input with another.
 func validateApplyPatchSnapshots(previous, current string) error {
@@ -347,6 +392,10 @@ func (st *claudeToResponsesState) emitFuncItem(idx int, requestJSON []byte, forc
 	d := st.ToolWinners[st.ToolNames.identity(name)]
 	st.FuncCustom[idx] = d.toolType == "custom"
 	outputIndex := st.functionOutputIndex(idx)
+	if st.isToolSearch(name) {
+		st.FuncItemAdded[idx] = true
+		return [][]byte{toolSearchCallEvent("response.output_item.added", nextSeq(), outputIndex, buildResponsesToolSearchCallItem(callID, "in_progress", ""))}
+	}
 	item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"in_progress","arguments":"","call_id":"","name":""}}`)
 	itemID := fmt.Sprintf("fc_%s", callID)
 	if st.FuncCustom[idx] {
@@ -364,7 +413,7 @@ func (st *claudeToResponsesState) emitFuncItem(idx int, requestJSON []byte, forc
 	}
 	item, _ = sjson.SetBytes(item, "item.id", itemID)
 	item, _ = sjson.SetBytes(item, "item.call_id", callID)
-	item = applyResponsesFunctionCallNamespaceFields(item, requestJSON, name, "item")
+	item = applyResponsesFunctionCallNamespaceFields(item, requestJSON, name, "item", st.ToolSearch)
 	item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
 	item, _ = sjson.SetBytes(item, "output_index", outputIndex)
 	st.FuncItemAdded[idx] = true
@@ -372,7 +421,7 @@ func (st *claudeToResponsesState) emitFuncItem(idx int, requestJSON []byte, forc
 }
 
 func (st *claudeToResponsesState) emitPendingFuncArgs(idx int, nextSeq func() int) [][]byte {
-	if !st.FuncItemAdded[idx] || st.ToolInputError() != nil {
+	if !st.FuncItemAdded[idx] || st.ToolInputError() != nil || st.isToolSearch(st.FuncNames[idx]) {
 		return nil
 	}
 	buf := st.FuncArgsBuf[idx]
@@ -426,14 +475,22 @@ func (st *claudeToResponsesState) finalizeFuncItem(idx int, requestForToolMetada
 			args = buf.String()
 		}
 	}
-	if !st.FuncCustom[idx] && args == "" && status == "completed" {
-		args = "{}"
-	}
 	callID := st.FuncCallIDs[idx]
 	if callID == "" {
 		callID = st.CurrentFCID
 	}
 	name := st.FuncNames[idx]
+
+	if st.isToolSearch(name) {
+		status = toolSearchCallStatus(status, args)
+		st.FuncItemStatus[idx] = status
+		out = append(out, toolSearchCallEvent("response.output_item.done", nextSeq(), outputIndex, buildResponsesToolSearchCallItem(callID, status, args)))
+		st.InFuncBlock = false
+		return out
+	}
+	if !st.FuncCustom[idx] && args == "" && status == "completed" {
+		args = "{}"
+	}
 
 	if st.FuncCustom[idx] {
 		input := ""
@@ -474,7 +531,7 @@ func (st *claudeToResponsesState) finalizeFuncItem(idx int, requestForToolMetada
 		itemDone, _ = sjson.SetBytes(itemDone, "item.status", status)
 		itemDone, _ = sjson.SetBytes(itemDone, "item.input", input)
 		itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", callID)
-		itemDone = applyResponsesFunctionCallNamespaceFields(itemDone, requestForToolMetadata, name, "item")
+		itemDone = applyResponsesFunctionCallNamespaceFields(itemDone, requestForToolMetadata, name, "item", st.ToolSearch)
 		out = append(out, emitEvent("response.output_item.done", itemDone))
 	} else {
 		if !st.FuncArgsDone[idx] {
@@ -497,7 +554,7 @@ func (st *claudeToResponsesState) finalizeFuncItem(idx int, requestForToolMetada
 		itemDone, _ = sjson.SetBytes(itemDone, "item.status", status)
 		itemDone, _ = translatorcommon.SetStringWithoutHTMLEscape(itemDone, "item.arguments", args)
 		itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", callID)
-		itemDone = applyResponsesFunctionCallNamespaceFields(itemDone, requestForToolMetadata, name, "item")
+		itemDone = applyResponsesFunctionCallNamespaceFields(itemDone, requestForToolMetadata, name, "item", st.ToolSearch)
 		out = append(out, emitEvent("response.output_item.done", itemDone))
 	}
 	st.InFuncBlock = false
@@ -613,12 +670,14 @@ func (st *claudeToResponsesState) finalizeAssistantMessage(nextSeq func() int) [
 	return out
 }
 
-func newClaudeToResponsesState(requestJSON []byte) *claudeToResponsesState {
+func newClaudeToResponsesState(requestJSON []byte, toolSearch bool) *claudeToResponsesState {
 	root := gjson.ParseBytes(requestJSON)
-	winners := responsesToolWinners(root)
+	winners := responsesToolWinners(root, toolSearch)
 	return &claudeToResponsesState{
+		ToolSearch:              toolSearch,
+		RequestJSON:             requestJSON,
 		ToolWinners:             winners,
-		ToolNames:               buildClaudeToolNamesWithWinners(root, winners),
+		ToolNames:               buildClaudeToolNamesWithWinners(root, winners, toolSearch),
 		ApplyPatchCalls:         make(map[string]*translatorcommon.ApplyPatchCallState),
 		FuncItemAdded:           make(map[int]bool),
 		FuncArgsSent:            make(map[int]int),
@@ -641,7 +700,7 @@ func newClaudeToResponsesState(requestJSON []byte) *claudeToResponsesState {
 // ConvertClaudeResponseToOpenAIResponses converts Claude SSE to OpenAI Responses SSE events.
 func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
-		*param = newClaudeToResponsesState(pickRequestJSON(originalRequestRawJSON, requestRawJSON))
+		*param = newClaudeToResponsesState(pickRequestJSON(originalRequestRawJSON, requestRawJSON), ClientToolSearchEnabledFor(ctx))
 	}
 	st := (*param).(*claudeToResponsesState)
 	if st.ToolInputError() != nil || st.CompletedEmitted {
@@ -654,7 +713,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 	}
 	rawJSON = bytes.TrimSpace(rawJSON[5:])
 	root := gjson.ParseBytes(rawJSON)
-	requestForToolMetadata := pickRequestJSON(originalRequestRawJSON, requestRawJSON)
+	requestForToolMetadata := st.RequestJSON
 	ev := root.Get("type").String()
 	var out [][]byte
 
@@ -856,8 +915,20 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			// A result block carries its full content up front and has no deltas.
 			// Results are stored here and the item is closed when the next block
 			// starts or at message_stop so the final stop_reason is respected.
-			if item := st.WebSearchByToolID[cb.Get("tool_use_id").String()]; item != nil {
+			toolUseID := cb.Get("tool_use_id").String()
+			if item := st.WebSearchByToolID[toolUseID]; item != nil {
 				item.Results = claudeWebSearchResultsToResponses(cb.Get("content"))
+			} else if toolUseID != "" {
+				// A continuation after pause_turn delivers the result of a search
+				// whose server_tool_use arrived in the previous response. Surface it
+				// under the same id so the client keeps the result in its history.
+				item := st.startWebSearch(idx, toolUseID)
+				item.Results = claudeWebSearchResultsToResponses(cb.Get("content"))
+				added := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"web_search_call","status":"in_progress","action":{"type":"search","query":""}}}`)
+				added, _ = sjson.SetBytes(added, "sequence_number", nextSeq())
+				added, _ = sjson.SetBytes(added, "output_index", item.OutputIndex)
+				added, _ = sjson.SetBytes(added, "item.id", responsesWebSearchCallID(item.ToolUseID))
+				out = append(out, emitEvent("response.output_item.added", added))
 			} else {
 				log.Debugf("claude->responses: web_search_tool_result without matching server_tool_use at block %d", idx)
 			}
@@ -972,7 +1043,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		}
 		for _, item := range st.WebSearchItems {
 			if !item.Emitted {
-				out = append(out, st.finalizeWebSearchWithStatus(item, toolStatus, nextSeq)...)
+				out = append(out, st.finalizeWebSearchWithStatus(item, claudeResponsesWebSearchStatus(st.StopReason, toolStatus, len(item.Results) > 0), nextSeq)...)
 			}
 		}
 
@@ -986,9 +1057,15 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		if len(incompleteDetails) > 0 {
 			completed, _ = sjson.SetRawBytes(completed, "response.incomplete_details", incompleteDetails)
 		}
+		if claudeStopReasonContextWindowExceeded(st.StopReason) {
+			completed, _ = sjson.SetRawBytes(completed, "response.error", claudeResponsesContextWindowError())
+		}
+		if claudeStopReasonPauseTurn(st.StopReason) {
+			completed, _ = sjson.SetBytes(completed, "response.end_turn", false)
+		}
 		// Inject original request fields into response as per docs/response.completed.json
 
-		reqBytes := pickRequestJSON(originalRequestRawJSON, requestRawJSON)
+		reqBytes := st.RequestJSON
 		if len(reqBytes) > 0 {
 			req := gjson.ParseBytes(reqBytes)
 			if v := req.Get("instructions"); v.Exists() {
@@ -1123,7 +1200,9 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				if callID == "" && st.CurrentFCID != "" {
 					callID = st.CurrentFCID
 				}
-				if st.FuncCustom[idx] {
+				if st.isToolSearch(name) {
+					outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, fmt.Sprintf("arr.%d", st.FuncOutputIndices[idx]), buildResponsesToolSearchCallItem(callID, status, args))
+				} else if st.FuncCustom[idx] {
 					item := []byte(`{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}`)
 					item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("ctc_%s", callID))
 					item, _ = sjson.SetBytes(item, "status", status)
@@ -1135,7 +1214,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 					}
 					item, _ = sjson.SetBytes(item, "input", input)
 					item, _ = sjson.SetBytes(item, "call_id", callID)
-					item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, name, "")
+					item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, name, "", st.ToolSearch)
 					outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, fmt.Sprintf("arr.%d", st.FuncOutputIndices[idx]), item)
 				} else {
 					item := []byte(`{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`)
@@ -1143,7 +1222,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 					item, _ = sjson.SetBytes(item, "status", status)
 					item, _ = translatorcommon.SetStringWithoutHTMLEscape(item, "arguments", args)
 					item, _ = sjson.SetBytes(item, "call_id", callID)
-					item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, name, "")
+					item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, name, "", st.ToolSearch)
 					outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, fmt.Sprintf("arr.%d", st.FuncOutputIndices[idx]), item)
 				}
 			}
@@ -1176,7 +1255,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 }
 
 // ConvertClaudeResponseToOpenAIResponsesNonStream aggregates Claude SSE into a single OpenAI Responses JSON.
-func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []byte {
+func ConvertClaudeResponseToOpenAIResponsesNonStream(ctx context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []byte {
 	rawJSON, nativeModel := translatorcommon.ClaudeMessagesJSONToSSE(rawJSON)
 	// Aggregate Claude SSE lines into a single OpenAI Responses JSON (non-stream)
 	// We follow the same aggregation logic as the streaming variant but produce
@@ -1203,7 +1282,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	}
 
 	reqBytes := pickRequestJSON(originalRequestRawJSON, requestRawJSON)
-	st := newClaudeToResponsesState(reqBytes)
+	st := newClaudeToResponsesState(reqBytes, ClientToolSearchEnabledFor(ctx))
 	if param != nil {
 		*param = st
 	}
@@ -1300,7 +1379,9 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				activeMessageItem = item
 			case "tool_use":
 				itemType := "function_call"
-				if d := st.ToolWinners[st.ToolNames.identity(cb.Get("name").String())]; d.toolType == "custom" {
+				if st.isToolSearch(cb.Get("name").String()) {
+					itemType = "tool_search_call"
+				} else if st.ToolWinners[st.ToolNames.identity(cb.Get("name").String())].toolType == "custom" {
 					itemType = "custom_tool_call"
 				}
 				item := blockToItem[idx]
@@ -1336,9 +1417,12 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 						return []byte(gjson.GetBytes(translatorcommon.ApplyPatchFailure(responseID, 0), "response").Raw)
 					}
 				}
-				if item.itemType == "custom_tool_call" {
+				switch item.itemType {
+				case "custom_tool_call":
 					item.id = fmt.Sprintf("ctc_%s", item.callID)
-				} else {
+				case "tool_search_call":
+					item.id = responsesToolSearchIDPrefix + item.callID
+				default:
 					item.id = fmt.Sprintf("fc_%s", item.callID)
 				}
 			case "server_tool_use":
@@ -1358,8 +1442,17 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 					item.args.WriteString(input.Raw)
 				}
 			case "web_search_tool_result":
-				if item := webSearchByToolID[cb.Get("tool_use_id").String()]; item != nil {
+				toolUseID := cb.Get("tool_use_id").String()
+				if item := webSearchByToolID[toolUseID]; item != nil {
 					item.results = claudeWebSearchResultsToResponses(cb.Get("content"))
+				} else if toolUseID != "" {
+					// Continuation after pause_turn: the search started in the
+					// previous response; keep its result under the same id.
+					item := newOutputItem("web_search_call", idx)
+					item.id = responsesWebSearchCallID(toolUseID)
+					item.callID = toolUseID
+					item.results = claudeWebSearchResultsToResponses(cb.Get("content"))
+					webSearchByToolID[toolUseID] = item
 				} else {
 					log.Debugf("claude->responses: web_search_tool_result without matching server_tool_use at block %d", idx)
 				}
@@ -1385,7 +1478,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 					}
 				}
 			case "input_json_delta":
-				if item != nil && (item.itemType == "function_call" || item.itemType == "custom_tool_call" || item.itemType == "web_search_call") {
+				if item != nil && (item.itemType == "function_call" || item.itemType == "custom_tool_call" || item.itemType == "tool_search_call" || item.itemType == "web_search_call") {
 					if pj := d.Get("partial_json"); pj.Exists() {
 						item.args.WriteString(pj.String())
 					}
@@ -1432,6 +1525,12 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	out, _ = sjson.SetBytes(out, "status", responseStatus)
 	if len(incompleteDetails) > 0 {
 		out, _ = sjson.SetRawBytes(out, "incomplete_details", incompleteDetails)
+	}
+	if claudeStopReasonContextWindowExceeded(stopReason) {
+		out, _ = sjson.SetRawBytes(out, "error", claudeResponsesContextWindowError())
+	}
+	if claudeStopReasonPauseTurn(stopReason) {
+		out, _ = sjson.SetBytes(out, "end_turn", false)
 	}
 
 	// Inject request echo fields as top-level (similar to streaming variant)
@@ -1509,7 +1608,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	outputs := make([][]byte, 0, len(outputItems))
 	for i, outputItem := range outputItems {
 		itemStatus := "completed"
-		if responseStatus == "incomplete" && i == len(outputItems)-1 {
+		if (responseStatus == "incomplete" || responseStatus == "failed") && i == len(outputItems)-1 {
 			itemStatus = "incomplete"
 		}
 		var item []byte
@@ -1524,7 +1623,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			item, _ = sjson.SetRawBytes(item, "summary", translatorcommon.JoinRawArray([][]byte{summary}))
 		case "web_search_call":
 			item = buildResponsesWebSearchCallItem(outputItem.callID, claudeWebSearchQuery(outputItem.args.String()), outputItem.results)
-			item, _ = sjson.SetBytes(item, "status", itemStatus)
+			item, _ = sjson.SetBytes(item, "status", claudeResponsesWebSearchStatus(stopReason, itemStatus, len(outputItem.results) > 0))
 		case "message":
 			item = []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
 			item, _ = sjson.SetBytes(item, "id", outputItem.id)
@@ -1533,6 +1632,9 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			if len(outputItem.annotations) > 0 {
 				item, _ = sjson.SetBytes(item, "content.0.annotations", outputItem.annotations)
 			}
+		case "tool_search_call":
+			args := outputItem.args.String()
+			item = buildResponsesToolSearchCallItem(outputItem.callID, toolSearchCallStatus(itemStatus, args), args)
 		case "function_call", "custom_tool_call":
 			if outputItem.itemType == "custom_tool_call" {
 				item = []byte(`{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}`)
@@ -1556,7 +1658,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				}
 				item, _ = sjson.SetBytes(item, "input", input)
 				item, _ = sjson.SetBytes(item, "call_id", outputItem.callID)
-				item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, outputItem.name, "")
+				item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, outputItem.name, "", st.ToolSearch)
 				break
 			}
 			args := outputItem.args.String()
@@ -1568,7 +1670,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			item, _ = sjson.SetBytes(item, "status", itemStatus)
 			item, _ = translatorcommon.SetStringWithoutHTMLEscape(item, "arguments", args)
 			item, _ = sjson.SetBytes(item, "call_id", outputItem.callID)
-			item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, outputItem.name, "")
+			item = applyResponsesFunctionCallNamespaceFields(item, reqBytes, outputItem.name, "", st.ToolSearch)
 		}
 		if len(item) > 0 {
 			outputs = append(outputs, item)
